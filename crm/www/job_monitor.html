@@ -1,0 +1,310 @@
+{% extends "templates/web.html" %}
+
+{% block title %}Background Job Monitor{% endblock %}
+
+{% block page_content %}
+<div class="container py-4" id="jobMonitor">
+    <h1 class="mb-4">Background Job Monitor</h1>
+    
+    <div class="card mb-4">
+        <div class="card-header bg-primary text-white">
+            <h5 class="mb-0">Recent Jobs</h5>
+        </div>
+        <div class="card-body">
+            <div class="mb-3">
+                <button class="btn btn-primary" @click="refreshJobs">Refresh Jobs</button>
+            </div>
+            
+            <div v-if="loading" class="text-center py-4">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">Loading...</span>
+                </div>
+                <p class="mt-2">Loading jobs...</p>
+            </div>
+            
+            <div v-else-if="jobs.length === 0" class="alert alert-info">
+                No jobs found. Try generating emails to see jobs here.
+            </div>
+            
+            <div v-else class="table-responsive">
+                <table class="table table-striped table-hover">
+                    <thead>
+                        <tr>
+                            <th>Job ID</th>
+                            <th>Status</th>
+                            <th>Progress</th>
+                            <th>Leads</th>
+                            <th>Success/Error</th>
+                            <th>Created</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr v-for="job in jobs" :key="job.job_id" :class="{'table-success': job.status === 'completed', 'table-warning': job.status === 'running', 'table-danger': job.status === 'error'}">
+                            <td><code>${ job.job_id }</code></td>
+                            <td>
+                                <span v-if="job.status === 'queued'" class="badge bg-secondary">Queued</span>
+                                <span v-else-if="job.status === 'running'" class="badge bg-warning text-dark">Running</span>
+                                <span v-else-if="job.status === 'completed'" class="badge bg-success">Completed</span>
+                                <span v-else-if="job.status === 'error'" class="badge bg-danger">Error</span>
+                                <span v-else class="badge bg-info">${ job.status }</span>
+                            </td>
+                            <td>
+                                <div class="progress" style="height: 20px;">
+                                    <div class="progress-bar" role="progressbar" :style="{width: job.progress + '%'}" 
+                                         :class="{'bg-warning': job.status === 'running', 'bg-success': job.status === 'completed', 'bg-danger': job.status === 'error'}"
+                                         :aria-valuenow="job.progress" aria-valuemin="0" aria-valuemax="100">
+                                        ${ job.progress }%
+                                    </div>
+                                </div>
+                            </td>
+                            <td>${ job.leads_count }</td>
+                            <td>${ job.success_count }/${ job.error_count }</td>
+                            <td>${ formatDate(job.timestamp) }</td>
+                            <td>
+                                <button class="btn btn-sm btn-info me-1" @click="viewJobDetails(job.job_id)">
+                                    Details
+                                </button>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Job Details Modal -->
+    <div class="modal fade" id="jobDetailsModal" tabindex="-1" aria-labelledby="jobDetailsModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header" :class="{'bg-success text-white': selectedJob.status === 'completed', 'bg-warning': selectedJob.status === 'running', 'bg-danger text-white': selectedJob.status === 'error'}">
+                    <h5 class="modal-title" id="jobDetailsModalLabel">Job Details: ${ selectedJob.job_id }</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div v-if="loadingDetails" class="text-center py-4">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">Loading...</span>
+                        </div>
+                        <p class="mt-2">Loading job details...</p>
+                    </div>
+                    
+                    <div v-else>
+                        <div class="row mb-3">
+                            <div class="col-md-6">
+                                <div class="card">
+                                    <div class="card-header bg-primary text-white">
+                                        Job Information
+                                    </div>
+                                    <div class="card-body">
+                                        <p><strong>Status:</strong> 
+                                            <span v-if="selectedJob.status === 'queued'" class="badge bg-secondary">Queued</span>
+                                            <span v-else-if="selectedJob.status === 'running'" class="badge bg-warning text-dark">Running</span>
+                                            <span v-else-if="selectedJob.status === 'completed'" class="badge bg-success">Completed</span>
+                                            <span v-else-if="selectedJob.status === 'error'" class="badge bg-danger">Error</span>
+                                            <span v-else class="badge bg-info">${ selectedJob.status }</span>
+                                        </p>
+                                        <p><strong>Progress:</strong> ${ selectedJob.progress }%</p>
+                                        <p><strong>Created:</strong> ${ formatDate(selectedJob.timestamp) }</p>
+                                        <p><strong>Last Updated:</strong> ${ formatDate(selectedJob.last_updated) }</p>
+                                        <p><strong>User:</strong> ${ selectedJob.user }</p>
+                                        <p><strong>Total Leads:</strong> ${ selectedJob.leads_count }</p>
+                                        <p><strong>Tone:</strong> ${ selectedJob.tone }</p>
+                                        <p><strong>Test Mode:</strong> ${ selectedJob.test_mode ? 'Yes' : 'No' }</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="card">
+                                    <div class="card-header bg-primary text-white">
+                                        Progress Summary
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="progress mb-3" style="height: 25px;">
+                                            <div class="progress-bar bg-success" role="progressbar" 
+                                                 :style="{width: (selectedJob.success_count / selectedJob.leads_count * 100) + '%'}" 
+                                                 aria-valuenow="30" aria-valuemin="0" aria-valuemax="100">
+                                                ${ selectedJob.success_count } Success
+                                            </div>
+                                            <div class="progress-bar bg-danger" role="progressbar" 
+                                                 :style="{width: (selectedJob.error_count / selectedJob.leads_count * 100) + '%'}" 
+                                                 aria-valuenow="20" aria-valuemin="0" aria-valuemax="100">
+                                                ${ selectedJob.error_count } Error
+                                            </div>
+                                            <div class="progress-bar bg-secondary" role="progressbar" 
+                                                 :style="{width: ((selectedJob.leads_count - selectedJob.success_count - selectedJob.error_count) / selectedJob.leads_count * 100) + '%'}" 
+                                                 aria-valuenow="50" aria-valuemin="0" aria-valuemax="100">
+                                                ${ selectedJob.leads_count - selectedJob.success_count - selectedJob.error_count } Pending
+                                            </div>
+                                        </div>
+                                        
+                                        <p><strong>Successfully Processed:</strong> ${ selectedJob.success_count }</p>
+                                        <p><strong>Failed:</strong> ${ selectedJob.error_count }</p>
+                                        <p><strong>Pending:</strong> ${ selectedJob.leads_count - selectedJob.success_count - selectedJob.error_count }</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="card">
+                            <div class="card-header bg-primary text-white">
+                                Job Log
+                            </div>
+                            <div class="card-body">
+                                <div v-if="!selectedJob.log_entries || selectedJob.log_entries.length === 0" class="alert alert-info">
+                                    No log entries available.
+                                </div>
+                                <div v-else class="log-entries">
+                                    <div v-for="(log, index) in selectedJob.log_entries" :key="index" class="log-entry">
+                                        <span class="text-muted">${ formatTime(log.time) }</span>
+                                        <span>${ log.message }</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-primary" @click="refreshJobDetails">Refresh</button>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block style %}
+<style>
+.log-entries {
+    max-height: 300px;
+    overflow-y: auto;
+    background-color: #f8f9fa;
+    border-radius: 5px;
+    padding: 10px;
+}
+
+.log-entry {
+    padding: 5px 0;
+    border-bottom: 1px dashed #dee2e6;
+}
+
+.log-entry .text-muted {
+    display: inline-block;
+    min-width: 160px;
+    margin-right: 10px;
+}
+</style>
+{% endblock %}
+
+{% block script %}
+<script src="https://cdn.jsdelivr.net/npm/vue@3.2.45/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+
+<script>
+  frappe.ready(function() {
+    const { createApp } = Vue;
+    
+    const app = createApp({
+      delimiters: ['${', '}'],
+      data() {
+        return {
+          loading: true,
+          loadingDetails: false,
+          jobs: [],
+          selectedJob: {},
+          jobDetailsModal: null
+        };
+      },
+      mounted() {
+        this.refreshJobs();
+        this.jobDetailsModal = new bootstrap.Modal(document.getElementById('jobDetailsModal'));
+        
+        // Auto-refresh every 10 seconds if there are running jobs
+        setInterval(() => {
+          if (this.jobs.some(job => job.status === 'running' || job.status === 'queued')) {
+            this.refreshJobs();
+          }
+        }, 10000);
+        
+        // Check for job_id in URL parameters and show details if present
+        this.checkUrlForJobId();
+      },
+      methods: {
+        checkUrlForJobId() {
+          // Parse URL query parameters
+          const urlParams = new URLSearchParams(window.location.search);
+          const jobId = urlParams.get('job_id');
+          
+          if (jobId) {
+            console.log('Job ID found in URL:', jobId);
+            // Show job details directly when loaded from URL
+            setTimeout(() => {
+              this.viewJobDetails(jobId);
+            }, 500); // Small delay to ensure jobs are loaded
+          }
+        },
+        refreshJobs() {
+          this.loading = true;
+          frappe.call({
+            method: 'crm.api.ai_email.list_bulk_email_jobs',
+            callback: (response) => {
+              this.loading = false;
+              if (response.message && response.message.success) {
+                this.jobs = response.message.jobs;
+              } else {
+                frappe.msgprint('Error loading jobs: ' + (response.message ? response.message.message : 'Unknown error'));
+              }
+            },
+            error: (err) => {
+              this.loading = false;
+              frappe.msgprint('Error loading jobs: ' + err.message);
+            }
+          });
+        },
+        viewJobDetails(jobId) {
+          this.loadingDetails = true;
+          this.selectedJob = {};
+          this.jobDetailsModal.show();
+          
+          frappe.call({
+            method: 'crm.api.ai_email.get_bulk_email_job_status',
+            args: {
+              job_id: jobId
+            },
+            callback: (response) => {
+              this.loadingDetails = false;
+              if (response.message && response.message.success) {
+                this.selectedJob = response.message.job_data;
+              } else {
+                frappe.msgprint('Error loading job details: ' + (response.message ? response.message.message : 'Unknown error'));
+              }
+            },
+            error: (err) => {
+              this.loadingDetails = false;
+              frappe.msgprint('Error loading job details: ' + err.message);
+            }
+          });
+        },
+        refreshJobDetails() {
+          if (this.selectedJob && this.selectedJob.job_id) {
+            this.viewJobDetails(this.selectedJob.job_id);
+          }
+        },
+        formatDate(dateStr) {
+          if (!dateStr) return 'N/A';
+          const date = new Date(dateStr);
+          return date.toLocaleString();
+        },
+        formatTime(timeStr) {
+          if (!timeStr) return 'N/A';
+          const date = new Date(timeStr);
+          return date.toLocaleTimeString();
+        }
+      }
+    });
+    
+    app.mount('#jobMonitor');
+  });
+</script>
+{% endblock %} 
