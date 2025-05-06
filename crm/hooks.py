@@ -61,7 +61,8 @@ add_to_apps_screen = [
 # }
 
 website_route_rules = [
-	{"from_route": "/crm/<path:app_path>", "to_route": "crm"},
+    {"from_route": "/crm", "to_route": "crm"},
+    {"from_route": "/crm/<path:app_path>", "to_route": "crm"},
 ]
 
 # Generators
