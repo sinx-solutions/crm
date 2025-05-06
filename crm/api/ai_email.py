@@ -6,7 +6,7 @@ from frappe import _
 from frappe.utils import now_datetime, get_formatted_email
 import requests
 from frappe.utils.background_jobs import enqueue
-import dotenv
+from dotenv import load_dotenv
 from openai import OpenAI
 import resend
 from pathlib import Path
@@ -76,7 +76,7 @@ def init_environment():
     try:
         if env_path.exists():
             logger.info(f"Loading .env from {env_path}")
-            dotenv.load_dotenv(env_path)
+            load_dotenv(env_path)
             
             # Check if the keys were loaded
             openrouter_key = os.environ.get("OPENROUTER_KEY")
