@@ -197,6 +197,22 @@ def generate_email_content(lead_name, tone="professional", additional_context=""
             "message": f"Error generating email: {str(e)}"
         }
 
+def get_default_system_prompt():
+    """Fetches the content of the default CRM AI System Prompt."""
+    try:
+        default_prompt_doc = frappe.db.get_value("CRM AI System Prompt", {"is_default": 1}, "prompt_content")
+        if default_prompt_doc:
+            log("Successfully fetched default CRM AI System Prompt.", "debug")
+            return default_prompt_doc
+        else:
+            log("No default CRM AI System Prompt found or 'prompt_content' is empty. Using fallback.", "warning")
+            # Refined fallback message as per Task 2.4
+            return "Fallback System Prompt: You are an expert AI assistant specializing in crafting business communications. Please generate a professional and relevant email based on the user\'s request."
+    except Exception as e:
+        log(f"Error fetching default CRM AI System Prompt: {str(e)}. Using fallback.", "error")
+        # Refined fallback message as per Task 2.4
+        return "Fallback System Prompt: You are an expert AI assistant specializing in crafting business communications. Please generate a professional and relevant email based on the user\'s request."
+
 def construct_prompt(lead_fields, tone, additional_context):
     """Construct the prompt for OpenAI API"""
     
@@ -283,6 +299,8 @@ def call_openrouter_api(prompt, api_key):
     """Generate personalized email content using OpenRouter AI."""
     log("Calling OpenRouter API (model: openai/gpt-4o)", "debug")
     
+    system_message_content = get_default_system_prompt() # Fetch dynamic system prompt
+
     try:
         client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
@@ -299,7 +317,7 @@ def call_openrouter_api(prompt, api_key):
             extra_headers=headers,
             model="openai/gpt-4o",  # Using GPT-4o
             messages=[
-                {"role": "system", "content": "You are an expert email copywriter who specializes in creating personalized business emails."},
+                {"role": "system", "content": system_message_content}, # Use fetched system prompt
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
