@@ -150,7 +150,6 @@ import Section from '@/components/Section.vue'
 import Email2Icon from '@/components/Icons/Email2Icon.vue'
 import PinIcon from '@/components/Icons/PinIcon.vue'
 import HelloIcon from '@/components/Icons/HelloIcon.vue'
-import AIEmailPromptIcon from '@/components/Icons/AIEmailPromptIcon.vue'
 import UserDropdown from '@/components/UserDropdown.vue'
 import LeadsIcon from '@/components/Icons/LeadsIcon.vue'
 import DealsIcon from '@/components/Icons/DealsIcon.vue'
@@ -235,11 +234,6 @@ const links = [
     label: 'Email Templates',
     icon: Email2Icon,
     to: 'Email Templates',
-  },
-  {
-    label: 'AI Email Prompts',
-    icon: AIEmailPromptIcon,
-    to: 'AI Email Prompts',
   },
   {
     label: 'Hello',

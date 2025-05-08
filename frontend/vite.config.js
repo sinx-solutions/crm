@@ -3,7 +3,7 @@ import vue from '@vitejs/plugin-vue'
 import vueJsx from '@vitejs/plugin-vue-jsx'
 import path from 'path'
 import frappeui from 'frappe-ui/vite'
-// import { VitePWA } from 'vite-plugin-pwa'
+import { VitePWA } from 'vite-plugin-pwa'
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -33,7 +33,6 @@ export default defineConfig({
     }),
     vue(),
     vueJsx(),
-    /*
     VitePWA({
       registerType: 'autoUpdate',
       devOptions: {
@@ -74,7 +73,6 @@ export default defineConfig({
         ],
       },
     }),
-    */
   ],
   resolve: {
     alias: {
