@@ -260,10 +260,10 @@ async function sendEmail() {
   const recipientsList = editorRef?.toEmails?.map(e => typeof e === 'string' ? e : e.id) || [];
   const ccList = editorRef?.ccEmails?.map(e => typeof e === 'string' ? e : e.id) || [];
   const bccList = editorRef?.bccEmails?.map(e => typeof e === 'string' ? e : e.id) || [];
-  const emailSubject = editorRef?.subject.value || subject.value; // Use subject from editor ref if available
-  const emailContent = editorRef?.content.value || newEmail.value; // Use content from editor ref if available
-  const templateName = editorRef?.selectedTemplateName.value; // Get selected template name
-  const isAI = editorRef?.isAIGenerated.value; // Check if AI was used
+  const emailSubject = editorRef?.subject || subject.value; // Remove .value from subject since it's already a ref
+  const emailContent = editorRef?.content || newEmail.value; // Remove .value from content since it's already a ref
+  const templateName = editorRef?.selectedTemplateName; // Remove .value from selectedTemplateName since it's already a ref
+  const isAI = editorRef?.isAIGenerated; // Remove .value from isAIGenerated since it's already a ref
 
   const emailDetails = {
     recipients: recipientsList,
