@@ -2,19 +2,19 @@
   <Dialog
     v-model="show"
     :options="{
-      title: __('Bulk AI Email Generator'),
+      title: __('Bulk Email Sender'),
       size: 'lg',
     }"
   >
     <template #body-content>
-      <div v-if="loading" class="flex flex-col items-center justify-center py-8">
+      <div v-if="generateEmailsResource.loading.value || emailTemplates.loading.value" class="flex flex-col items-center justify-center py-8">
         <div class="loading-dots">
           <span></span>
           <span></span>
           <span></span>
         </div>
         <p class="mt-4 text-center text-ink-gray-6">
-          {{ __('Processing bulk emails...') }}
+          {{ emailTemplates.loading.value ? __('Loading templates...') : __('Processing bulk emails...') }}
         </p>
       </div>
       <div v-else-if="error" class="rounded-md bg-ink-red-1 p-4 text-ink-red-9">
@@ -65,20 +65,15 @@
             </h3>
             <div class="mt-2 text-sm text-ink-green-9">
               <p>
-                {{ __('The bulk email generation job has been started. Check for emails in the activity timeline of each lead.') }}
+                {{ __('The bulk email job has been started using the selected template.') }}
               </p>
               <p class="mt-2">
-                {{ __('In test mode, all emails will be sent to the test email address.') }}
+                {{ __('In test mode, all emails will be sent to:') }} {{ testEmail }}
               </p>
               <p class="mt-2 font-medium">
                 {{ __('Note: It may take a few minutes for all emails to be generated and appear in the timeline.') }}
               </p>
               <div class="mt-4 flex gap-2">
-                <Button
-                  :label="__('View Process Logs')"
-                  variant="outline"
-                  @click="showLogs"
-                />
                 <Button
                   :label="__('View Job Monitor')"
                   variant="outline"
@@ -86,9 +81,6 @@
                   v-if="currentJobId"
                 />
               </div>
-              <p class="mt-2 text-xs text-ink-gray-7">
-                {{ __('View detailed logs of the email generation process') }}
-              </p>
             </div>
           </div>
         </div>
@@ -108,19 +100,16 @@
         <div class="mb-4">
           <FormControl
             type="select"
-            v-model="tone"
-            :label="__('Tone')"
-            :options="toneOptions"
+            v-model="selectedTemplateName"
+            :label="__('Select Email Template')"
+            :options="emailTemplateOptions"
+            :placeholder="__('Choose an email template...')"
+            :required="true"
+            :loading="emailTemplates.loading.value"
           />
-        </div>
-        <div class="mb-4">
-          <FormControl
-            type="textarea"
-            v-model="additionalContext"
-            :label="__('Additional Context (Optional)')"
-            :placeholder="__('Add any specific instructions or context for the AI generator...')"
-            :rows="3"
-          />
+          <div v-if="emailTemplates.error.value" class="mt-1 text-xs text-red-600">
+            {{ __('Error loading templates:') }} {{ emailTemplates.error.value.message }}
+          </div>
         </div>
         <div class="mb-4">
           <FormControl
@@ -139,26 +128,23 @@
             @click="show = false"
           />
           <Button
-            :label="__('Generate Emails')"
+            :label="__('Send Bulk Emails')"
             variant="solid"
-            :loading="loading"
-            @click="generateEmails"
+            :loading="generateEmailsResource.loading.value"
+            :disabled="!selectedTemplateName || generateEmailsResource.loading.value || emailTemplates.loading.value"
+            @click="() => { console.log('[BulkEmailModal Button Click]'); generateEmails(); }"
           />
         </div>
       </div>
     </template>
   </Dialog>
-  
-  <!-- Add the logs modal -->
-  <AIEmailLogsModal v-model="showLogsModal" />
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
-import { Dialog, FormControl, Button, createResource, call } from 'frappe-ui'
+import { ref, computed, onMounted, watch, onBeforeUnmount } from 'vue'
+import { Dialog, FormControl, Button, createResource, call, createListResource } from 'frappe-ui'
 import { __ } from '@/utils/translations'
 import { capture } from '@/telemetry'
-import AIEmailLogsModal from './AIEmailLogsModal.vue'
 import { useRouter } from 'vue-router'
 import { globalStore } from '@/stores/global'
 
@@ -173,302 +159,262 @@ const props = defineProps({
   }
 })
 
-// Initialize socket and router
 const { $socket } = globalStore()
 const router = useRouter()
 
 const show = defineModel()
 
-const tone = ref('professional')
-const additionalContext = ref('')
+const selectedTemplateName = ref(null)
 const testMode = ref(true)
-const loading = ref(false)
 const error = ref(null)
 const success = ref(null)
 const testEmail = ref('sanchayt@sinxsolutions.ai')
-const apiStatus = ref(null)
 const currentJobId = ref(null)
 
-const toneOptions = [
-  { label: __('Professional'), value: 'professional' },
-  { label: __('Friendly'), value: 'friendly' },
-  { label: __('Formal'), value: 'formal' },
-  { label: __('Persuasive'), value: 'persuasive' }
-]
+// NEW: Flag to track component mount status
+const isMounted = ref(false)
 
-const buttonDisabled = computed(() => {
-  return apiStatus.value && !apiStatus.value.openai_configured;
-})
-
-const processedLeads = ref([])
-
-// Setup socket listeners for real-time updates
-function setupRealtimeListeners() {
-  // Add debug logging for socket connection status
-  console.log('=== WEBSOCKET DEBUG ===');
-  console.log('Socket connected:', $socket.connected);
-  console.log('Socket instance:', $socket);
-  console.log('Setting up realtime listeners for bulk email events');
-
-  // Log all incoming socket events for debugging
-  $socket.onAny((event, ...args) => {
-    console.log(`Socket event received: ${event}`, args);
-  });
-  
-  // Add listener for test message
-  $socket.on('bulk_email_test', (data) => {
-    console.log('SOCKET TEST MESSAGE RECEIVED (DIRECT):', data);
-    // Show as a notification if possible
-    try {
-      if (window.Notification && Notification.permission === "granted") {
-        new Notification('Socket Test - Direct', { 
-          body: 'Socket connection is working! Test message received.' 
-        });
+const getUserEmail = createResource({
+  url: 'frappe.client.get_value',
+  makeParams: () => {
+    if (window.frappe?.session?.user) {
+      console.log("[BulkEmailModal DEBUG] getUserEmail makeParams: Creating params with user:", window.frappe.session.user);
+      return {
+        doctype: 'User',
+        filters: { name: window.frappe.session.user },
+        fieldname: 'email'
+      };
+    } else {
+      console.warn("[BulkEmailModal DEBUG] getUserEmail makeParams: frappe.session.user not available yet. Skipping API call.");
+      return null;
+    }
+  },
+  onSuccess(data) {
+    console.log("[BulkEmailModal DEBUG] getUserEmail onSuccess RAW data:", JSON.stringify(data));
+    
+    if (!isMounted.value) {
+      console.warn("[BulkEmailModal DEBUG] getUserEmail onSuccess: Component unmounted before callback executed. Skipping assignment.");
+      return;
+    }
+    
+    let userEmail = null;
+    if (data && data.message && typeof data.message.email === 'string') {
+      userEmail = data.message.email;
+      console.log("[BulkEmailModal DEBUG] getUserEmail onSuccess: Found email via data.message.email");
+    } else if (data && typeof data.message === 'string') {
+      if (data.message.includes('@')) {
+        userEmail = data.message;
+        console.log("[BulkEmailModal DEBUG] getUserEmail onSuccess: Found email via data.message");
+      } else {
+        console.warn("[BulkEmailModal DEBUG] getUserEmail onSuccess: data.message is a string but not an email:", data.message);
       }
-    } catch (e) {
-      console.error('Could not show notification:', e);
+    } else {
+      console.warn("[BulkEmailModal DEBUG] getUserEmail onSuccess: Could not extract email from response structure:", data);
     }
-  });
-  
-  // Add listener for user-specific test message
-  $socket.on('bulk_email_test_user', (data) => {
-    console.log('SOCKET TEST MESSAGE RECEIVED (USER SPECIFIC):', data);
-  });
-  
-  // Add listener for room test message
-  $socket.on('bulk_email_test_room', (data) => {
-    console.log('SOCKET TEST MESSAGE RECEIVED (ROOM):', data);
-  });
-  
-  // Listen for any bulk_* events
-  $socket.on('bulk_*', (data) => {
-    console.log('WILDCARD BULK EVENT RECEIVED:', data);
-  });
-  
-  $socket.on('bulk_email_progress', (data) => {
-    console.log('Bulk email progress update received:', data);
     
-    // If this lead was processed successfully, add to processed list
-    if (data.status === 'success') {
-      processedLeads.value.push(data.lead);
-      console.log('Updated processed leads list:', processedLeads.value);
-      
-      // If the current page is showing this lead, refresh the timeline
-      const currentRoute = router.currentRoute.value;
-      if (currentRoute.name === 'Lead' && currentRoute.params.id === data.lead) {
-        console.log('Refreshing current lead page:', data.lead);
-        // Trigger a reload of the document info for the lead
-        refreshLeadTimeline(data.lead);
-      }
+    if (userEmail) {
+      testEmail.value = userEmail;
+      console.log("[BulkEmailModal] Default test email set to user email:", testEmail.value);
+    } else {
+      console.warn("[BulkEmailModal] Did not find user email in response, keeping default test email.");
     }
-  });
-  
-  $socket.on('bulk_email_complete', (data) => {
-    console.log('Bulk email process completed event received:', data);
-    processedLeads.value = data.processed_leads || [];
-    
-    // Refresh current page if it's a lead page
-    const currentRoute = router.currentRoute.value;
-    if (currentRoute.name === 'Lead' && processedLeads.value.includes(currentRoute.params.id)) {
-      refreshLeadTimeline(currentRoute.params.id);
-    }
-  });
-  
-  // Check if socket is connected and log status
-  if (!$socket.connected) {
-    console.warn('WARNING: Socket is not connected! Real-time updates will not work.');
-    // Try reconnecting socket
-    $socket.connect();
-    console.log('Attempted to reconnect socket.');
-  }
-}
-
-function cleanupRealtimeListeners() {
-  $socket.off('bulk_email_progress')
-  $socket.off('bulk_email_complete')
-}
-
-// Function to refresh the timeline for a lead
-async function refreshLeadTimeline(leadId) {
-  try {
-    console.log('Refreshing lead timeline for:', leadId)
-    // Get fresh document info via Frappe API
-    await call('frappe.desk.form.load.get_docinfo', {
-      doctype: 'CRM Lead',
-      name: leadId
-    })
-    
-    // Emit a custom event that can be captured by parent components
-    $socket.emit('crm:refresh_timeline', { 
-      doctype: 'CRM Lead', 
-      name: leadId 
-    })
-    
-    console.log('Timeline refresh triggered for lead:', leadId)
-  } catch (err) {
-    console.error('Error refreshing lead timeline:', err)
-  }
-}
-
-onMounted(async () => {
-  try {
-    const response = await getApiStatus.submit();
-    apiStatus.value = response;
-    testEmail.value = response.test_email || testEmail.value;
-    
-    // Setup realtime listeners when component mounts
-    setupRealtimeListeners()
-  } catch (err) {
-    console.error('Error checking API status:', err);
+  },
+  onError(err) {
+    console.error("[BulkEmailModal DEBUG] getUserEmail onError:", err);
   }
 })
 
-onBeforeUnmount(() => {
-  // Clean up event listeners when component unmounts
-  cleanupRealtimeListeners()
+const emailTemplates = createListResource({
+  doctype: 'Email Template',
+  fields: ['name', 'subject'],
+  filters: { enabled: 1 },
+  orderBy: 'name asc',
+  limit: 0,
+  onError(err) {
+    console.error("[BulkEmailModal] Error fetching email templates:", err)
+    error.value = `Failed to load email templates: ${err.message}`
+  }
 })
 
-// Add this new polling setup that doesn't rely on WebSockets
-const POLLING_INTERVAL = 3000; // 3 seconds
-let pollingTimer = null;
+const emailTemplateOptions = computed(() => {
+  if (!emailTemplates.data) return []
+  return emailTemplates.data.map(template => ({
+    label: `${template.name} (Subject: ${template.subject || 'N/A'})`,
+    value: template.name
+  }))
+})
+
+watch(show, (newValue) => {
+  if (newValue && !emailTemplates.data && !emailTemplates.loading.value) {
+    console.log("[BulkEmailModal] Modal opened, fetching email templates.")
+    emailTemplates.fetch()
+  }
+})
+
+const generateEmailsResource = createResource({
+  url: 'crm.api.ai_email.generate_bulk_emails',
+  makeParams: () => {
+    console.log("[BulkEmailModal DEBUG] generateEmailsResource: makeParams called.")
+    const params = {
+      selected_leads: props.selectedLeads?.length ? JSON.stringify(props.selectedLeads.map(l => l.name)) : null,
+      filter_json: !props.selectedLeads?.length ? JSON.stringify(props.filters || {}) : null,
+      selected_template_name: selectedTemplateName.value,
+      test_mode: testMode.value ? 1 : 0
+    }
+    console.log("[BulkEmailModal DEBUG] generateEmailsResource: Params created:", params)
+    return params
+  },
+  onSuccess: (response) => {
+    console.log("[BulkEmailModal DEBUG] generateEmailsResource: onSuccess triggered. Response:", response)
+    if (response && response.job_id) {
+      currentJobId.value = response.job_id
+      success.value = response.message || __('Bulk email job started successfully.')
+      error.value = null
+      console.log("[BulkEmailModal] Job started successfully:", response.job_id)
+      startJobPolling(response.job_id)
+      capture('bulk_email_job_initiated', { template: selectedTemplateName.value, test_mode: testMode.value })
+    } else {
+      const errorMsg = (response && response.message) ? response.message : __('Failed to start bulk email job (invalid response).')
+      error.value = errorMsg
+      success.value = null
+      console.error("[BulkEmailModal] Job initiation failed or received invalid response:", response)
+      capture('bulk_email_job_error', { error: errorMsg })
+    }
+  },
+  onError: (err) => {
+    console.error("[BulkEmailModal DEBUG] generateEmailsResource: onError triggered. Error:", err)
+    error.value = err.message || __('An error occurred while starting the bulk email job.')
+    success.value = null
+    capture('bulk_email_job_error', { error: err.message })
+  }
+})
+
+function generateEmails() {
+  console.log("[BulkEmailModal DEBUG] generateEmails function started.")
+  if (!selectedTemplateName.value) {
+    console.warn("[BulkEmailModal DEBUG] generateEmails: No template selected.")
+    error.value = __('Please select an email template.')
+    return
+  }
+  error.value = null
+  success.value = null
+  console.log(`[BulkEmailModal DEBUG] Submitting job request with template: ${selectedTemplateName.value}, TestMode: ${testMode.value}`)
+  try {
+    generateEmailsResource.submit()
+    console.log("[BulkEmailModal DEBUG] generateEmailsResource.submit() called.")
+  } catch (submitError) {
+    console.error("[BulkEmailModal DEBUG] Error calling generateEmailsResource.submit():", submitError)
+    error.value = `Client-side error submitting job: ${submitError.message}`
+  }
+}
+
+const POLLING_INTERVAL = 5000
+let pollingTimer = null
 
 function startJobPolling(jobId) {
-  console.log(`Starting to poll for job status: ${jobId}`);
-  currentJobId.value = jobId;
-  
-  // Clear any existing timer
-  if (pollingTimer) {
-    clearInterval(pollingTimer);
-  }
-  
-  // Setup polling for job status
+  console.log(`[BulkEmailModal] Starting polling for job: ${jobId}`)
+  currentJobId.value = jobId
+  stopJobPolling()
+
   pollingTimer = setInterval(() => {
-    checkJobStatus(jobId);
-  }, POLLING_INTERVAL);
-  
-  // Initial check immediately
-  checkJobStatus(jobId);
+    checkJobStatus(jobId)
+  }, POLLING_INTERVAL)
+  checkJobStatus(jobId)
 }
 
 function stopJobPolling() {
   if (pollingTimer) {
-    clearInterval(pollingTimer);
-    pollingTimer = null;
+    console.log(`[BulkEmailModal] Stopping polling.`)
+    clearInterval(pollingTimer)
+    pollingTimer = null
   }
 }
 
 const checkJobStatus = async (jobId) => {
+  if (!jobId) return
   try {
     const result = await call('crm.api.ai_email.get_bulk_email_job_status', {
       job_id: jobId
-    });
+    })
     
-    if (result.success) {
-      const jobData = result.job_data;
-      console.log('Job status update:', jobData);
+    if (result.success && result.job_data) {
+      const jobData = result.job_data
+      console.log('[BulkEmailModal] Job status poll result:', jobData)
       
-      // Update processed leads if available
-      if (jobData.successful_leads && jobData.successful_leads.length > 0) {
-        processedLeads.value = jobData.successful_leads;
-      }
-      
-      // Check if job is completed
-      if (jobData.status === 'finished' || jobData.status === 'failed') {
-        if (jobData.progress >= 100) {
-          // Stop polling after a few more checks to ensure we get all updates
-          setTimeout(() => {
-            stopJobPolling();
-          }, POLLING_INTERVAL * 3);
+      if (jobData.status === 'finished' || jobData.status === 'completed' || jobData.status === 'failed') {
+        console.log(`[BulkEmailModal] Job ${jobId} finished with status: ${jobData.status}`)
+        stopJobPolling()
+        if (jobData.status === 'failed') {
+          error.value = jobData.error || __('Job failed. Check Job Monitor for details.')
+          success.value = null
+        } else {
+          let finalMsg = `Job completed. Successful: ${jobData.successful_leads?.length || 0}. Failed: ${jobData.failed_leads?.length || 0}.`
+          if (jobData.failed_leads?.length > 0) finalMsg += " Check Job Monitor for failed items."
+          success.value = finalMsg
         }
       }
+    } else {
+      console.warn("[BulkEmailModal] Failed to get job status update:", result.message)
     }
   } catch (error) {
-    console.error('Error checking job status:', error);
+    console.error('[BulkEmailModal] Error during job status polling:', error)
   }
-};
-
-// Cleanup polling on component unmount
-onBeforeUnmount(() => {
-  stopJobPolling();
-});
-
-// Update the generateEmails function to use the new polling mechanism
-const generateEmails = async () => {
-  loading.value = true;
-  error.value = null;
-  success.value = null;
-  
-  try {
-    // Create filter JSON string if leads are selected
-    let filterJson = null;
-    if (props.selectedLeads && props.selectedLeads.length > 0) {
-      // Extract just the lead names for the filter
-      const leadNames = props.selectedLeads.map(lead => lead.name);
-      console.log('Selected lead names:', leadNames);
-      
-      // Format as a "name is in [...]" filter
-      filterJson = JSON.stringify({
-        name: ["in", leadNames]
-      });
-      console.log('Using filter JSON:', filterJson);
-    } else {
-      // Use the current list filters if no leads are selected
-      filterJson = JSON.stringify(props.filters || {});
-    }
-    
-    // Track event in analytics
-    capture('bulk_ai_email_generate', {
-      leads_count: props.selectedLeads?.length || 0,
-      tone: tone.value,
-      test_mode: testMode.value
-    });
-    
-    // Call the API to generate emails
-    const result = await call('crm.api.ai_email.generate_bulk_emails', {
-      filter_json: filterJson,
-      tone: tone.value,
-      additional_context: additionalContext.value,
-      test_mode: testMode.value ? 1 : 0
-    });
-    
-    if (result.success) {
-      success.value = __('Bulk email generation started successfully!');
-      console.log('Job ID for monitoring:', result.job_id);
-      
-      // Start polling for updates
-      startJobPolling(result.job_id);
-    } else {
-      error.value = result.message || __('Failed to start bulk email generation');
-    }
-  } catch (err) {
-    error.value = err.message || __('An error occurred');
-    console.error('Error generating bulk emails:', err);
-  } finally {
-    loading.value = false;
-  }
-};
-
-const generateBulkEmails = createResource({
-  url: 'crm.api.ai_email.generate_bulk_emails',
-  validate(values) {
-    return null;
-  }
-});
-
-const getApiStatus = createResource({
-  url: 'crm.api.ai_email.get_api_status'
-});
-
-const showLogsModal = ref(false)
-
-function showLogs() {
-  showLogsModal.value = true
 }
 
 function openJobMonitor() {
-  const monitorUrl = `/job_monitor${currentJobId.value ? '?job_id=' + currentJobId.value : ''}`;
-  window.open(monitorUrl, '_blank');
+  if (currentJobId.value) {
+    window.open(`/app/background-job?name=${currentJobId.value}`, '_blank')
+  }
 }
+
+onMounted(() => {
+  console.log("[BulkEmailModal DEBUG] Entering onMounted.");
+  isMounted.value = true; // Set mounted flag
+  
+  const setupFrappeDependent = () => {
+    console.log("[BulkEmailModal DEBUG] setupFrappeDependent: Checking for window.frappe...");
+    if (window.frappe?.session?.user) {
+      console.log("[BulkEmailModal DEBUG] setupFrappeDependent: window.frappe found. User:", window.frappe.session.user);
+      
+      // --- CHECK IF MOUNTED before submitting ---
+      if (!isMounted.value) {
+        console.warn("[BulkEmailModal DEBUG] Component unmounted before submitting getUserEmail.");
+        return;
+      }
+      
+      if (getUserEmail && !getUserEmail.fetched) {
+        console.log("[BulkEmailModal DEBUG] Submitting getUserEmail resource.");
+        getUserEmail.submit();
+      } else {
+        console.log("[BulkEmailModal DEBUG] getUserEmail already fetched or resource invalid.");
+      }
+    } else {
+      console.warn("[BulkEmailModal DEBUG] setupFrappeDependent: window.frappe not ready yet. Retrying...");
+      // --- CHECK IF MOUNTED before scheduling retry ---
+      if (isMounted.value) {
+        setTimeout(setupFrappeDependent, 300);
+      } else {
+        console.warn("[BulkEmailModal DEBUG] Component unmounted, not scheduling retry.");
+      }
+    }
+  };
+
+  if (show.value && !emailTemplates.data && !emailTemplates.loading.value) {
+    console.log("[BulkEmailModal DEBUG] Fetching templates in onMounted.");
+    emailTemplates.fetch();
+  }
+  
+  // Start the process to get user email
+  setupFrappeDependent();
+  
+  console.log("[BulkEmailModal DEBUG] Exiting onMounted.");
+});
+
+onBeforeUnmount(() => {
+  console.log("[BulkEmailModal DEBUG] Running onBeforeUnmount, stopping polling and setting isMounted=false.");
+  isMounted.value = false; // Clear mounted flag
+  stopJobPolling();
+});
 </script>
 
 <style scoped>

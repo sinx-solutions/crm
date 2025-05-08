@@ -119,6 +119,7 @@ const templates = createListResource({
 
 onMounted(() => {
   if (templates.data == null) {
+    console.log('[EmailTemplateSelectorModal] Mounted. templates.data is null, fetching.');
     templates.fetch()
   }
 })
@@ -134,5 +135,20 @@ const filteredTemplates = computed(() => {
   )
 })
 
-watch(show, (value) => value && nextTick(() => searchInput.value?.el?.focus()))
+watch(show, (newValue, oldValue) => {
+  if (newValue === true) {
+    console.log('[EmailTemplateSelectorModal] Modal is now visible. Forcing a re-fetch of templates.');
+    templates.fetch();
+    nextTick(() => {
+      if (searchInput.value && searchInput.value.el) {
+        searchInput.value.el.focus();
+        console.log('[EmailTemplateSelectorModal] Search input focused.');
+      } else {
+        console.log('[EmailTemplateSelectorModal] Search input or searchInput.value.el not available for focus.');
+      }
+    });
+  } else {
+    console.log('[EmailTemplateSelectorModal] Modal is now hidden.');
+  }
+});
 </script>

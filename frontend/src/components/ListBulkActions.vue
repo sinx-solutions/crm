@@ -213,7 +213,7 @@ function bulkActions(selections, unselectAll) {
       onClick: () => convertToDeal(selections, unselectAll),
     })
     actions.push({
-      label: __('Generate AI Emails'),
+      label: __('Send Bulk Email'),
       onClick: () => {
         // Get the selected leads as an array
         const selectionArray = Array.from(selections);

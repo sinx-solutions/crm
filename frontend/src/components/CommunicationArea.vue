@@ -97,9 +97,10 @@ import { usersStore } from '@/stores/users'
 import { useStorage } from '@vueuse/core'
 import { call, createResource } from 'frappe-ui'
 import { useOnboarding } from 'frappe-ui/frappe'
-import { ref, watch, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, watch, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { __ } from '../utils/translations'
 import { globalStore } from '@/stores/global'
+import { validateEmail } from '@/utils'
 
 const props = defineProps({
   doctype: {
@@ -107,6 +108,8 @@ const props = defineProps({
     default: 'CRM Lead',
   },
 })
+
+const loading = ref(false)
 
 // Get socket from globalStore
 const { $socket } = globalStore()
@@ -151,7 +154,7 @@ const signature = createResource({
 
 function setSignature(editor) {
   if (!signature.data) return
-  signature.data = signature.data.replace(/\n/g, '<br>')
+  signature.data = signature.data.replace(/\\n/g, '<br>')
   let emailContent = editor.getHTML()
   emailContent = emailContent.startsWith('<p></p>')
     ? emailContent.slice(7)
@@ -192,87 +195,114 @@ const emailEmpty = computed(() => {
   )
 })
 
-async function sendMail() {
-  console.log("==== EMAIL PROCESS STARTING ====");
-  let recipients = newEmailEditor.value.toEmails
-  let subject = newEmailEditor.value.subject
-  let cc = newEmailEditor.value.ccEmails || []
-  let bcc = newEmailEditor.value.bccEmails || []
+// ADDED: Basic email validation function
+function isValidEmailFormat(email) {
+  if (!email || typeof email !== 'string') return false;
+  return validateEmail(email);
+}
 
-  console.log("Email details:", {
-    recipients,
-    subject,
-    doctype: props.doctype,
-    name: doc.value.data.name,
-    hasAttachments: attachments.value.length > 0
-  });
-
-  if (attachments.value.length) {
-    capture('email_attachments_added')
+function validateEmailsBeforeSend() {
+  const toEmailsList = newEmailEditor.value?.toEmails || [];
+  if (!toEmailsList.length) {
+    console.error('[CommunicationArea] Validation Error: No recipients in TO field.');
+    return false;
   }
 
-  try {
-    console.log("Calling send_ai_email API...");
-    // Use the API which will now always use Frappe's email system
-    const response = await call('crm.api.ai_email.send_ai_email', {
-      recipients: recipients.join(', '),
-      cc: cc.join(', '),
-      bcc: bcc.join(', '),
-      subject: subject,
-      content: newEmail.value,
-      doctype: props.doctype,
-      name: doc.value.data.name
-    });
-    
-    console.log("API response:", response);
-    
-    // Log analytics
-    if (newEmailEditor.value?.isAIGenerated) {
-      capture('ai_email_sent', { doctype: props.doctype });
-    } else {
-      capture('email_sent', { doctype: props.doctype });
-    }
-    
-    // Trigger a refresh of the document to show the new email in timeline
-    console.log("Refreshing document to show email in timeline");
-    
-    // First clear the reload flag to force reactivity
-    reload.value = false;
-    
-    // Wait a bit for the email to be fully processed
-    setTimeout(async () => {
-      try {
-        // Trigger a complete document reload using Frappe's reload_docinfo
-        console.log("Reload document info");
-        await call('frappe.desk.form.load.get_docinfo', {
-          doctype: props.doctype,
-          name: doc.value.data.name
-        });
-        
-        console.log("Setting reload flag");
-        reload.value = true;
-        
-        // Scroll to show the newly added email
-        setTimeout(() => {
-          emit('scroll');
-          console.log("Scrolled to latest content");
-        }, 300);
-      } catch (error) {
-        console.error("Error refreshing doc info:", error);
-        // Still try to refresh the UI even if API call failed
-        reload.value = true;
+  const allEmailGroups = {
+    to: toEmailsList,
+    cc: newEmailEditor.value?.ccEmails || [],
+    bcc: newEmailEditor.value?.bccEmails || [],
+  };
+
+  for (const groupName in allEmailGroups) {
+    const emailArray = allEmailGroups[groupName];
+    for (const item of emailArray) {
+      let emailId = null;
+      if (typeof item === 'string') {
+        emailId = item;
+      } else if (item && typeof item.id === 'string') {
+        emailId = item.id;
       }
-    }, 1000);
-    
-    // Update onboarding step if applicable
-    updateOnboardingStep('send_first_email');
-    
-    console.log("==== EMAIL PROCESS COMPLETED SUCCESSFULLY ====");
-    return true;
+
+      if (!emailId || !emailId.trim()) {
+        // If it\'s an empty/null/undefined emailId
+        if (groupName === 'to') {
+          // TO field cannot have empty entries if the array itself is not empty
+          console.error(`[CommunicationArea] Validation Error: Empty or invalid email entry in TO field.`);
+          return false;
+        }
+        // For CC/BCC, an empty entry might be permissible, so we continue
+        console.warn(`[CommunicationArea] Validation Warning: Empty email entry in ${groupName.toUpperCase()} field.`);
+        continue; 
+      }
+
+      if (!isValidEmailFormat(emailId)) {
+        console.error(`[CommunicationArea] Validation Error: Invalid email format in ${groupName.toUpperCase()} field - ${emailId}`);
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+async function sendEmail() {
+  console.log('==== EMAIL PROCESS STARTING ====', newEmailEditor.value);
+  if (!validateEmailsBeforeSend()) { 
+    console.error('[CommunicationArea] Email validation failed. Aborting send.');
+    return; 
+  }
+
+  loading.value = true;
+  console.log('[CommunicationArea] Email validation passed.');
+  
+  // Extract data from the EmailEditor component
+  const editorRef = newEmailEditor.value;
+  const recipientsList = editorRef?.toEmails?.map(e => typeof e === 'string' ? e : e.id) || [];
+  const ccList = editorRef?.ccEmails?.map(e => typeof e === 'string' ? e : e.id) || [];
+  const bccList = editorRef?.bccEmails?.map(e => typeof e === 'string' ? e : e.id) || [];
+  const emailSubject = editorRef?.subject.value || subject.value; // Use subject from editor ref if available
+  const emailContent = editorRef?.content.value || newEmail.value; // Use content from editor ref if available
+  const templateName = editorRef?.selectedTemplateName.value; // Get selected template name
+  const isAI = editorRef?.isAIGenerated.value; // Check if AI was used
+
+  const emailDetails = {
+    recipients: recipientsList,
+    cc: ccList,
+    bcc: bccList,
+    subject: emailSubject,
+    content: emailContent, // Content from the editor
+    selected_template_name: templateName, // Pass the selected template name
+    doctype: props.doctype,
+    name: doc.value.data.name,
+    // attachments: attachments.value, // Add attachment handling if needed
+  };
+
+  console.log('[CommunicationArea] Preparing to call send_ai_email API with details:', emailDetails);
+  
+  try {
+    const response = await call('crm.api.ai_email.send_ai_email', emailDetails);
+    console.log('[CommunicationArea] API response:', response);
+
+    if (response.success) {
+      capture('email_sent', { ai_generated: isAI, template_used: !!templateName });
+      newEmail.value = ''; // Clear editor content
+      showEmailBox.value = false;
+      reload.value = true;
+      console.log('[CommunicationArea] Refreshing document to show email in timeline');
+      nextTick(() => emit('scroll'));
+      updateOnboardingStep('compose-email', 'complete');
+      console.log('==== EMAIL PROCESS COMPLETED SUCCESSFULLY ====');
+    } else {
+      console.error('[CommunicationArea] Error sending email:', response.message);
+      // TODO: Show error toast to user based on response.message
+      alert(`Error sending email: ${response.message || 'Unknown server error'}`);
+    }
   } catch (error) {
-    console.error("Error sending email:", error);
-    console.log("==== EMAIL PROCESS FAILED ====");
-    return false;
+    console.error('[CommunicationArea] Exception during sendEmail API call:', error);
+    // TODO: Show error toast to user
+    alert(`Error sending email: ${error.message || 'Client-side error'}`);
+  } finally {
+    loading.value = false;
   }
 }
 
@@ -293,33 +323,8 @@ async function sendComment() {
   }
 }
 
-async function submitEmail() {
-  if (emailEmpty.value) return
-  showEmailBox.value = false
-  
-  // Try to send the email
-  const success = await sendMail()
-  
-  if (success) {
-    // Reset the email form only if sent successfully
-    newEmail.value = ''
-    
-    // Clear the email editor content and reset fields
-    if (newEmailEditor.value) {
-      newEmailEditor.value.subject = subject.value
-      newEmailEditor.value.toEmails = doc.value.data.email ? [doc.value.data.email] : []
-      newEmailEditor.value.ccEmails = []
-      newEmailEditor.value.bccEmails = []
-      newEmailEditor.value.cc = false
-      newEmailEditor.value.bcc = false
-      newEmailEditor.value.isAIGenerated = false
-    }
-    
-    attachments.value = []
-  } else {
-    // If there was an error, show the email box again
-    showEmailBox.value = true
-  }
+function submitEmail() {
+  sendEmail();
 }
 
 async function submitComment() {

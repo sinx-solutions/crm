@@ -40,7 +40,7 @@
             "fieldtype": "Data",
             "label": "Target AI Model (Optional)",
             "in_list_view": 1,
-            "description": "e.g., \"gpt-4o\", \"claude-3-opus\""
+            "description": "e.g., \\\"gpt-4o\\\", \\\"claude-3-opus\\\""
         },
         {
             "fieldname": "description",

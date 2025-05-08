@@ -6,7 +6,7 @@ from frappe import _
 from frappe.utils import now_datetime, get_formatted_email
 import requests
 from frappe.utils.background_jobs import enqueue
-from dotenv import load_dotenv
+import dotenv
 from openai import OpenAI
 import resend
 from pathlib import Path
@@ -76,7 +76,7 @@ def init_environment():
     try:
         if env_path.exists():
             logger.info(f"Loading .env from {env_path}")
-            load_dotenv(env_path)
+            dotenv.load_dotenv(env_path)
             
             # Check if the keys were loaded
             openrouter_key = os.environ.get("OPENROUTER_KEY")
@@ -131,217 +131,247 @@ def log(message, level="info"):
 
 @frappe.whitelist()
 def generate_email_content(lead_name, tone="professional", additional_context=""):
-    """Generate email content for a lead using AI"""
-    # Initialize environment if needed
+    """Generate email content for a lead using AI, based on V3 prompt logic."""
     init_environment()
-    
-    log(f"Generating email for lead: {lead_name}", "info")
+    log(f"AI_PROMPT_V3_FLOW: generate_email_content - START for lead: {lead_name}, tone: {tone}", "info")
     
     try:
-        # Get the lead data
         lead = frappe.get_doc("CRM Lead", lead_name)
-        log(f"Lead data retrieved: {lead.first_name} {lead.last_name}", "debug")
+        log(f"AI_PROMPT_V3_FLOW: Lead data retrieved for: {lead.name}", "debug")
         
-        # Get all fields as dictionary
-        lead_fields = lead.as_dict()
+        lead_fields_dict = lead.as_dict()
         
-        # Remove any large or unnecessary fields
-        fields_to_exclude = ["amended_from", "docstatus", "parent", "parentfield", 
-                            "parenttype", "idx", "owner", "creation", "modified", 
-                            "modified_by", "doctype", "_user_tags", "__islocal"]
-        
-        for field in fields_to_exclude:
-            if field in lead_fields:
-                del lead_fields[field]
-        
-        log(f"Lead fields prepared for AI context. Fields: {', '.join(lead_fields.keys())}", "debug")
-        
-        # Get API key from environment variables
         openrouter_key = os.getenv("OPENROUTER_KEY")
-        
         if not openrouter_key:
-            log("OpenRouter API key not found in .env file", "error")
-            return {
-                "success": False,
-                "message": "OpenRouter API key not configured. Please add it to .env file."
-            }
+            log("AI_PROMPT_V3_FLOW: OpenRouter API key not found in .env file", "error")
+            frappe.throw(_("OpenRouter API key not configured. Please add it to .env file."), title="Configuration Error")
         
-        # Construct prompt for the AI
-        prompt = construct_prompt(lead_fields, tone, additional_context)
-        log("Prompt constructed for AI", "debug")
+        log(f"AI_PROMPT_V3_FLOW: Calling construct_prompt (V3) for lead: {lead.name}", "debug")
+        # Pass lead_fields_dict, and the UI-selected tone and additional_context
+        prompt_string_to_send, model_identifier_to_use = construct_prompt(
+            lead_fields_dict, 
+            ui_tone_preference=tone, 
+            ui_additional_context=additional_context
+        )
+        log(f"AI_PROMPT_V3_FLOW: Received from construct_prompt - Model: '{model_identifier_to_use}'. Prompt (first 100 chars): {prompt_string_to_send[:100]}...", "debug")
         
-        # Call OpenRouter API (using GPT-4o)
-        response = call_openrouter_api(prompt, openrouter_key)
-        log("Received response from OpenRouter API", "debug")
+        log(f"AI_PROMPT_V3_FLOW: Calling OpenRouter API for lead: {lead.name}", "debug")
+        response = call_openrouter_api(prompt_string_to_send, openrouter_key, model_identifier_to_use)
+        log(f"AI_PROMPT_V3_FLOW: Received response from OpenRouter API for lead: {lead.name}. Success: {response.get('success')}", "debug")
         
         if not response["success"]:
             return response
         
-        # For testing, always send to test email
-        log("Returning generated content to frontend", "info")
-        
+        log(f"AI_PROMPT_V3_FLOW: Returning generated content to frontend for lead: {lead.name}", "info")
         return {
             "success": True,
             "subject": response["subject"],
             "content": response["content"],
             "debug_info": {
                 "lead_name": lead.lead_name,
-                "tone": tone
+                "tone_preference_from_ui": tone, # Reflect what UI sent
+                "model_used": model_identifier_to_use or "openai/gpt-4o" # Default if none from DB
             }
         }
         
+    except frappe.DoesNotExistError as e:
+        log(f"AI_PROMPT_V3_FLOW: Error - Lead '{lead_name}' not found: {str(e)}", "error")
+        frappe.throw(_("Lead '{0}' not found.").format(lead_name), title="Not Found")
     except Exception as e:
-        log(f"Error generating email content: {str(e)}", "error")
-        return {
+        log(f"AI_PROMPT_V3_FLOW: Error in generate_email_content for lead {lead_name}: {str(e)}", "error")
+        log(f"AI_PROMPT_V3_FLOW: Traceback: {frappe.get_traceback()}", "error")
+        if not frappe.exc_already_raised:
+             frappe.throw(_("Error generating email content: {0}").format(str(e)), title="Generation Error")
+        return { 
             "success": False,
             "message": f"Error generating email: {str(e)}"
         }
 
-def get_default_system_prompt():
-    """Fetches the content of the default CRM AI System Prompt."""
-    try:
-        default_prompt_doc = frappe.db.get_value("CRM AI System Prompt", {"is_default": 1}, "prompt_content")
-        if default_prompt_doc:
-            log("Successfully fetched default CRM AI System Prompt.", "debug")
-            return default_prompt_doc
-        else:
-            log("No default CRM AI System Prompt found or 'prompt_content' is empty. Using fallback.", "warning")
-            # Refined fallback message as per Task 2.4
-            return "Fallback System Prompt: You are an expert AI assistant specializing in crafting business communications. Please generate a professional and relevant email based on the user\'s request."
-    except Exception as e:
-        log(f"Error fetching default CRM AI System Prompt: {str(e)}. Using fallback.", "error")
-        # Refined fallback message as per Task 2.4
-        return "Fallback System Prompt: You are an expert AI assistant specializing in crafting business communications. Please generate a professional and relevant email based on the user\'s request."
-
-def construct_prompt(lead_fields, tone, additional_context):
-    """Construct the prompt for OpenAI API"""
-    
-    # Basic lead info
-    lead_name = f"{lead_fields.get('first_name', '')} {lead_fields.get('last_name', '')}".strip()
-    organization = lead_fields.get('organization', 'their organization')
-    email = lead_fields.get('email', '')
-    job_title = lead_fields.get('job_title', 'professional')
-    industry = lead_fields.get('industry', '')
-    
-    # Get current user (sender) information
-    sender_info = {}
-    try:
-        user = frappe.get_doc("User", frappe.session.user)
-        sender_info = {
-            "name": user.full_name,
-            "email": user.email,
-            "designation": user.designation or "Solutions Consultant",
-            "phone": user.phone or ""
-        }
-    except Exception as e:
-        frappe.log(f"AI Email DEBUG: Error getting sender info: {str(e)}")
-        sender_info = {
-            "name": "Sinx Team",
-            "email": "info@sinxsolutions.ai",
-            "designation": "Solutions Consultant",
-            "phone": ""
-        }
-    
-    # Product context
-    product_context = """
-    Sinx Solutions offers: 
-    - BUNDLR: AI-powered product bundling to maximize cart value
-    - PERSONALIZR: Real-time persona generation for precise marketing
-    - CATALOGR: Intelligent product categorization for better navigation
-    - REPORTR: Auto-generated visual insights for quick decision-making
-    - RECOMMENDR: Context-aware product recommendations
-    - AI CONSULTANCY: Custom AI solution development
-    - MY CAREER GROWTH: AI-driven personalized career guidance
-    - KNOWTICE: Real-time, AI-curated industry notifications
+def construct_prompt(lead_fields_dict, ui_tone_preference, ui_additional_context):
+    """ (V3 Logic)
+    Constructs the AI prompt by:
+    1. Fetching master instructions from the default CRM AI System Prompt.
+    2. Preparing a detailed block of ONLY lead-specific data.
+    3. Allowing the master instructions (as a Jinja template) to embed this lead data and UI preferences.
+    4. If lead data isn't embedded by the template, it's appended separately.
+    5. Appending a standard JSON output format instruction.
     """
+    log(f"AI_PROMPT_V3_FLOW: construct_prompt (V3) - START. UI Tone: '{ui_tone_preference}'", "info")
+
+    # 1. Fetch Base Prompt (Master Instructions) & Model ID from CRM AI System Prompt (default)
+    default_prompt_settings = frappe.db.get_value(
+        "CRM AI System Prompt", 
+        {"is_default": 1},
+        ["name", "prompt_content", "model_identifier"], 
+        as_dict=True
+    )
+
+    if not default_prompt_settings:
+        log("AI_PROMPT_V3_FLOW: No default CRM AI System Prompt found.", "error")
+        frappe.throw(_("Default AI System Prompt not configured. Please set one."), title="Configuration Error")
+        return None, None # Defensive return after throw
     
-    # Tone guidelines
-    tone_guidelines = {
-        "professional": "Write in a clear, formal, and professional manner appropriate for business communication.",
-        "friendly": "Write in a warm, approachable tone while maintaining professionalism.",
-        "formal": "Write in a highly formal, somewhat conservative tone suitable for traditional industries.",
-        "persuasive": "Write in a compelling, benefit-focused tone that encourages action."
+    db_prompt_name = default_prompt_settings.get("name")
+    db_master_prompt_instructions = default_prompt_settings.get("prompt_content")
+    db_model_identifier = default_prompt_settings.get("model_identifier")
+
+    if not db_master_prompt_instructions or not db_master_prompt_instructions.strip():
+        log(f"AI_PROMPT_V3_FLOW: Default CRM AI System Prompt '{db_prompt_name}' has empty content.", "error")
+        frappe.throw(_("Default AI System Prompt ('{0}') content is empty.").format(db_prompt_name), title="Configuration Error")
+        return None, None # Defensive return after throw
+
+    log(f"AI_PROMPT_V3_FLOW: Fetched default AI System Prompt: '{db_prompt_name}'. Model: '{db_model_identifier}'. DB Instructions (len {len(db_master_prompt_instructions)}): {db_master_prompt_instructions[:100]}...", "debug")
+
+    # 2. Prepare ONLY Lead-Specific Data Block & other context for Jinja
+    log("AI_PROMPT_V3_FLOW: Preparing lead details and Jinja context...", "debug")
+    
+    lead_display_name_str = f"{lead_fields_dict.get('first_name', '')} {lead_fields_dict.get('last_name', '')}".strip() or lead_fields_dict.get('name', 'Valued Contact')
+    
+    json_relevant_lead_fields = {}
+    for k, v in lead_fields_dict.items():
+        if not k.startswith(("_", "idx", "naming_series", "image", "timeline_hash")) and k not in [
+            "amended_from", "docstatus", "doctype", "modified_by", "owner", "parent", 
+            "parentfield", "parenttype", "creation", "modified"
+        ] and v is not None:
+            json_relevant_lead_fields[k] = v
+    lead_all_fields_json_str = json.dumps(json_relevant_lead_fields, indent=2, cls=CustomJSONEncoder, ensure_ascii=False)
+    log(f"AI_PROMPT_V3_FLOW: Lead JSON data prepared (length: {len(lead_all_fields_json_str)}).", "debug")
+
+    # Explicitly build the standalone block string by string to avoid complex f-string issues.
+    lead_details_standalone_block_parts = []
+    lead_details_standalone_block_parts.append("--- Lead Information ---")
+    lead_details_standalone_block_parts.append(f"Name: {lead_display_name_str}")
+    lead_details_standalone_block_parts.append(f"Email: {lead_fields_dict.get('email_id') or lead_fields_dict.get('email', 'N/A')}")
+    lead_details_standalone_block_parts.append(f"Organization: {lead_fields_dict.get('organization', 'N/A')}")
+    lead_details_standalone_block_parts.append(f"Job Title: {lead_fields_dict.get('job_title', 'N/A')}")
+    lead_details_standalone_block_parts.append(f"Industry: {lead_fields_dict.get('industry', 'N/A')}")
+    lead_details_standalone_block_parts.append("\nFull Lead Data (JSON format for AI reference if needed):")
+    lead_details_standalone_block_parts.append(lead_all_fields_json_str)
+    lead_details_standalone_block = "\n".join(lead_details_standalone_block_parts)
+
+    # 3. Render the Database Prompt (allowing it to use Jinja to embed lead data and UI inputs)
+    # Simplified lead_summary_text construction
+    _lead_org = lead_fields_dict.get('organization', 'N/A')
+    _lead_title = lead_fields_dict.get('job_title', 'N/A')
+    lead_summary_text_val = f"Lead: {lead_display_name_str}, Org: {_lead_org}, Title: {_lead_title}"
+
+    jinja_context_for_db_prompt = {
+        'lead_summary_text': lead_summary_text_val,
+        'lead_data_json': lead_all_fields_json_str,
+        'lead_raw_dict': lead_fields_dict,
+        'user_requested_tone': ui_tone_preference,
+        'user_additional_instructions': ui_additional_context,
+        'current_frappe_user': frappe.session.user
     }
-    
-    # Convert lead_fields to JSON using custom encoder for datetime objects
-    lead_fields_json = json.dumps(lead_fields, indent=2, cls=CustomJSONEncoder)
-    
-    prompt = f"""
-    You are writing a highly personalized email from {sender_info['name']} ({sender_info['designation']} at Sinx Solutions) to {lead_name} who works at {organization} as a {job_title} in the {industry} industry.
+    # Using the simplified logging that was confirmed to be okay before.
+    log(f"AI_PROMPT_V3_FLOW: Jinja context for DB prompt prepared. Keys: {list(jinja_context_for_db_prompt.keys())}", "debug")
 
-    Lead Information:
-    {lead_fields_json}
-    
-    Product Information:
-    {product_context}
-    
-    Instructions:
-    1. Create a personalized email that connects Sinx Solutions' products SPECIFICALLY to the lead's industry, role, company size, and other relevant attributes.
-    2. ONLY suggest 2-3 products that are MOST relevant to this specific lead based on their data - don't mention all products.
-    3. Explain specifically how those selected products would solve challenges common in their industry or role.
-    4. Include specific, data-driven reasons why these solutions would benefit them - not generic benefits.
-    5. DO NOT include ANY placeholder text like [Your Name] or [Your Position] - use the actual sender information provided.
-    6. Start the email body directly with your introduction and value proposition.
-    7. The email should be concise (200-300 words), direct, and focus on value proposition.
-    8. Include your full signature details (name, title, email, phone) at the end of the email.
-    9. {tone_guidelines.get(tone, tone_guidelines["professional"])}
+    try:
+        rendered_db_instructions = frappe.render_template(db_master_prompt_instructions, jinja_context_for_db_prompt)
+        log(f"AI_PROMPT_V3_FLOW: Rendered DB master instructions using Jinja. Length: {len(rendered_db_instructions)}", "debug")
+    except Exception as render_err:
+        log(f"AI_PROMPT_V3_FLOW: Error rendering DB master instructions as Jinja template: {str(render_err)}. Using raw DB instructions.", "warning")
+        rendered_db_instructions = db_master_prompt_instructions
 
-    Additional Context/Instructions:
-    {additional_context}
-    
-    Format your response as JSON with a 'subject' field and 'content' field.
-    The 'content' should be formatted as HTML with appropriate paragraph tags.
-    """
-    
-    return prompt
+    main_prompt_body = rendered_db_instructions
 
-def call_openrouter_api(prompt, api_key):
-    """Generate personalized email content using OpenRouter AI."""
-    log("Calling OpenRouter API (model: openai/gpt-4o)", "debug")
-    
-    system_message_content = get_default_system_prompt() # Fetch dynamic system prompt
+    # 4. Append lead_details_standalone_block IF it wasn't already incorporated by Jinja rendering
+    if lead_all_fields_json_str not in main_prompt_body:
+        main_prompt_body += "\n\n" + lead_details_standalone_block
+        log(f"AI_PROMPT_V3_FLOW: Appended lead_details_standalone_block as JSON segment not found in rendered DB prompt.", "debug")
+    else:
+        log(f"AI_PROMPT_V3_FLOW: Lead details (JSON segment) seem to be included via Jinja in DB prompt. Standalone block not appended.", "debug")
 
+    # 5. Append JSON Output Instruction (always, this is not optional)
+    json_output_directive = (
+        "\n\n--- MANDATORY OUTPUT FORMAT ---"
+        "\nYour entire response MUST be a single, valid JSON object."
+        "\nThis JSON object MUST contain exactly two fields:"
+        "\n1. \"subject\": A string for the email subject."
+        "\n2. \"content\": A string containing the complete email body, formatted as HTML (e.g., using <p>, <ul>, <li>, <strong> tags, etc.)."
+        "\nExample of valid JSON output:"
+        "\n{\n  \"subject\": \"Regarding Your Recent Inquiry About Product X\","
+        "\n  \"content\": \"<p>Dear User,</p><p>Thank you for your interest...</p>\""
+        "\n}"
+        "\nDo NOT include any text or explanations outside of this JSON object."
+    )
+    
+    final_prompt_to_ai = main_prompt_body + json_output_directive
+
+    log(f"AI_PROMPT_V3_FLOW: Final prompt assembled. Total length: {len(final_prompt_to_ai)}", "info")
+    log(f"AI_PROMPT_V3_FLOW: Final prompt (first 300 chars): {final_prompt_to_ai[:300]}...", "debug")
+    
+    return final_prompt_to_ai, db_model_identifier
+
+def call_openrouter_api(prompt, api_key, model_identifier=None):
+    """ (V3 Logic) Generate content using OpenRouter AI with specified model."""
+    
+    final_model_to_use = model_identifier if model_identifier and model_identifier.strip() else "openai/gpt-4o"
+    log(f"AI_PROMPT_V3_FLOW: call_openrouter_api - START. Model: '{final_model_to_use}'. Prompt (first 50 chars): {prompt[:50]}...", "info")
+    
     try:
         client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=api_key,
         )
         
-        # Optional headers for OpenRouter
         headers = {
-            "HTTP-Referer": "https://sinxsolutions.ai", 
-            "X-Title": "Sinx CRM - AI Email Generator"
+            "HTTP-Referer": frappe.utils.get_url(), # Use actual site URL
+            "X-Title": "Sinx CRM AI Email" 
         }
         
+        log(f"AI_PROMPT_V3_FLOW: Sending request to OpenRouter. Model: {final_model_to_use}", "debug")
         completion = client.chat.completions.create(
             extra_headers=headers,
-            model="openai/gpt-4o",  # Using GPT-4o
+            model=final_model_to_use, 
             messages=[
-                {"role": "system", "content": system_message_content}, # Use fetched system prompt
+                {"role": "system", "content": "You are an AI assistant. Follow the user's instructions carefully and precisely, especially regarding output format."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.7,
-            max_tokens=800,
-            response_format={"type": "json_object"}
+            temperature=0.7, 
+            max_tokens=2048, # Increased for potentially complex HTML + subject
+            response_format={"type": "json_object"} 
         )
         
-        content = completion.choices[0].message.content
-        log(f"Received response from OpenRouter", "debug")
+        response_content_str = completion.choices[0].message.content
+        log(f"AI_PROMPT_V3_FLOW: Raw response from OpenRouter (model {final_model_to_use}). Length: {len(response_content_str)}", "debug")
+        log(f"AI_PROMPT_V3_FLOW: Raw response content (first 100 chars): {response_content_str[:100]}...", "debug")
         
-        # Parse JSON response
-        content_json = json.loads(content)
+        try:
+            content_json = json.loads(response_content_str)
+            log(f"AI_PROMPT_V3_FLOW: Successfully parsed JSON response from AI. Keys: {', '.join(content_json.keys())}", "debug")
+        except json.JSONDecodeError as e_json:
+            log(f"AI_PROMPT_V3_FLOW: JSONDecodeError from OpenRouter (model {final_model_to_use}): {str(e_json)}", "error")
+            log(f"AI_PROMPT_V3_FLOW: Faulty JSON string from AI (first 500 chars): {response_content_str[:500]}", "error")
+            return {
+                "success": False,
+                "message": f"AI returned malformed JSON. Response from AI was: '{response_content_str[:200]}...'. Error: {str(e_json)}"
+            }
+
+        subject = content_json.get("subject")
+        email_body_html = content_json.get("content")
+
+        if subject is None or email_body_html is None:
+            missing_fields_str = ", ".join(f for f in ["subject", "content"] if content_json.get(f) is None)
+            log(f"AI_PROMPT_V3_FLOW: AI JSON response missing required field(s): '{missing_fields_str}'. Keys found: {', '.join(content_json.keys())}", "error")
+            return {
+                "success": False,
+                "message": f"AI response was valid JSON but missing required fields: {missing_fields_str}. Check AI's adherence to output format instructions."
+            }
         
+        log(f"AI_PROMPT_V3_FLOW: call_openrouter_api - SUCCESS. Subject: '{subject[:50]}...'", "info")
         return {
             "success": True,
-            "subject": content_json.get("subject", "Introduction from Sinx Solutions"),
-            "content": content_json.get("content", "<p>Error parsing AI response.</p>")
+            "subject": subject,
+            "content": email_body_html
         }
         
-    except Exception as e:
-        log(f"Error calling OpenRouter API: {str(e)}", "error")
+    except Exception as e_api:
+        log(f"AI_PROMPT_V3_FLOW: Error during OpenRouter API call (model {final_model_to_use}): {str(e_api)}", "error")
+        log(f"AI_PROMPT_V3_FLOW: Traceback: {frappe.get_traceback()}", "error")
         return {
             "success": False,
-            "message": f"Error calling OpenRouter API: {str(e)}"
+            "message": f"Error during OpenRouter API call ({final_model_to_use}): {str(e_api)}"
         }
 
 @frappe.whitelist()
@@ -526,416 +556,359 @@ def render_full_email(ai_generated_body: str, lead_data: dict, sender_name: str,
     return rendered_html
 
 @frappe.whitelist()
-def generate_bulk_emails(filter_json=None, tone="professional", additional_context="", test_mode=1):
-    """Generate AI emails for leads based on filters
+def generate_bulk_emails(filter_json=None, selected_leads=None, selected_template_name=None, test_mode=1):
+    """Initiates a bulk email job using a selected Frappe Email Template.
     
     Args:
-        filter_json (str, optional): JSON string of filters. Defaults to None.
-        tone (str, optional): Email tone. Defaults to "professional".
-        additional_context (str, optional): Additional context for AI. Defaults to "".
-        test_mode (int, optional): Send to test email only. Defaults to 1.
+        filter_json (str, optional): JSON string of list view filters if selected_leads is not provided.
+        selected_leads (str, optional): JSON string array of specific lead names to process.
+        selected_template_name (str, optional): The name of the Frappe Email Template to use.
+        test_mode (int, optional): 1 for test mode (sends to user), 0 for live. Defaults to 1.
     
     Returns:
-        dict: Response with job ID
+        dict: Response with job ID or error message.
     """
-    # Initialize environment
     init_environment()
-    
-    log(f"Starting bulk email generation with tone: {tone}", "info")
-    
-    # DEBUGGING: Print all incoming parameters
-    print("\n==== BULK EMAIL DEBUG ====")
-    print(f"RECEIVED PARAMETERS:")
-    print(f"filter_json: {filter_json}")
-    print(f"tone: {tone}")
-    print(f"additional_context: {additional_context}")
-    print(f"test_mode: {test_mode}")
-    print(f"test_mode type: {type(test_mode)}")
-    
-    # Add detailed logging to file
-    log(f"RECEIVED PARAMETERS IN API:", "info")
-    log(f"filter_json: {filter_json}", "info")
-    log(f"tone: {tone}", "info")
-    log(f"additional_context: {additional_context}", "info")
-    log(f"test_mode: {test_mode} (type: {type(test_mode)})", "info")
-    
-    # Convert test_mode to actual boolean if it's a string
+    log(f"==== BULK EMAIL (TEMPLATE BASED) START ====", "info")
+    log(f"PARAMS: filter_json='{filter_json}', selected_leads='{selected_leads}', template='{selected_template_name}', test_mode={test_mode}", "info")
+
+    if not selected_template_name:
+        log("ERROR: No email template selected for bulk send.", "error")
+        return {"success": False, "message": _("Please select an email template.")}
+
+    # Convert test_mode to boolean more robustly
+    is_test_mode = True
     if isinstance(test_mode, str):
-        test_mode = test_mode.lower() == 'true'
-        print(f"Converted test_mode to: {test_mode}")
-        log(f"Converted test_mode to: {test_mode}", "info")
-    
+        is_test_mode = test_mode.lower() == 'true' or test_mode == '1'
+    elif isinstance(test_mode, (int, float)):
+        is_test_mode = bool(test_mode)
+    log(f"Processed test_mode: {is_test_mode} (original: {test_mode})", "debug")
+
     try:
-        # Parse filters if provided
-        filters = {}
-        if filter_json:
+        leads_to_process = []
+        if selected_leads:
+            try:
+                lead_names = json.loads(selected_leads)
+                if not isinstance(lead_names, list):
+                    raise ValueError("selected_leads should be a JSON array of names.")
+                # Fetch minimal lead data for these names
+                leads_to_process = frappe.get_list("CRM Lead", 
+                                                filters={"name": ("in", lead_names)},
+                                                fields=["name", "email"], # Only need name and email for the job
+                                                limit_page_length=len(lead_names) + 10) # Fetch all selected
+                log(f"Fetched {len(leads_to_process)} leads based on selected_leads array.", "info")
+            except Exception as e:
+                log(f"Error processing selected_leads JSON: {str(e)}", "error")
+                return {"success": False, "message": f"Invalid selected_leads format: {str(e)}"}
+        elif filter_json:
             try:
                 filters = json.loads(filter_json)
-                log(f"Using filters: {filters}", "debug")
-                print(f"DEBUG - Parsed filters: {filters}")
+                leads_to_process = frappe.get_list("CRM Lead", 
+                                                filters=filters,
+                                                fields=["name", "email"],
+                                                limit_page_length=1000) # Safety limit for filter-based
+                log(f"Fetched {len(leads_to_process)} leads based on filter_json.", "info")
             except json.JSONDecodeError as e:
-                log(f"Error parsing filter JSON: {str(e)}", "error")
-                print(f"DEBUG - Error parsing filter JSON: {str(e)}")
-                return {
-                    "success": False,
-                    "message": f"Invalid filter format: {str(e)}"
-                }
+                log(f"Error parsing filter_json: {str(e)}", "error")
+                return {"success": False, "message": f"Invalid filter_json format: {str(e)}"}
         else:
-            log("No filters provided, will fetch all leads", "info")
-            print("DEBUG - No filters provided, will fetch all leads")
-        
-        # Get leads matching the filters
-        try:
-            log(f"Querying CRM Lead with filters: {filters}", "debug")
-            print(f"DEBUG - Querying CRM Lead with filters: {filters}")
-            leads = frappe.get_list("CRM Lead", 
-                                filters=filters,
-                                fields=["name", "email", "first_name", "last_name", "organization", "industry", "job_title", "source", "status"],
-                                limit_page_length=100)  # Limit for safety
-            print(f"DEBUG - Query returned {len(leads)} leads")
-            print(f"DEBUG - First few leads: {leads[:5] if leads else 'None'}")
-            
-            # Log complete lead details to file
-            log(f"Query returned {len(leads)} leads", "info")
-            for i, lead in enumerate(leads):
-                log(f"Lead {i+1}: {json.dumps(lead, indent=2, cls=CustomJSONEncoder)}", "info")
-            
-            # For debugging, store lead information in a system setting
-            try:
-                # Create temporary storage for leads data for debugging
-                frappe.cache().set_value("last_bulk_email_leads", json.dumps(leads, cls=CustomJSONEncoder), expires_in_sec=3600)
-                log("Cached leads data for debugging", "info")
-            except Exception as cache_err:
-                log(f"Warning: Could not cache leads data: {str(cache_err)}", "warning")
-                
-        except Exception as e:
-            log(f"Database error when fetching leads: {str(e)}", "error") 
-            print(f"DEBUG - Database error: {str(e)}")
-            return {
-                "success": False,
-                "message": f"Error fetching leads: {str(e)}"
-            }
-        
-        lead_count = len(leads)
-        log(f"Found {lead_count} leads matching the filters", "info")
-        print(f"DEBUG - Found {lead_count} leads matching the filters")
-        
+            log("ERROR: Neither selected_leads nor filter_json provided for bulk email.", "error")
+            return {"success": False, "message": _("No leads specified for bulk email.")}
+
+        lead_count = len(leads_to_process)
         if lead_count == 0:
-            # Provide more detailed error message
-            filter_details = json.dumps(filters, indent=2)
-            log(f"No leads found with filters: {filter_details}", "error")
-            print(f"DEBUG - No leads found with filters: {filter_details}")
-            return {
-                "success": False,
-                "message": f"No leads found matching the filters. Please check your selection or filters.\n\nFilter details: {filter_details}"
-            }
-        
-        # Start background job for processing - IMPORTANT: We use the job.id from RQ now
-        print(f"DEBUG - Starting background job for {lead_count} leads with tone: {tone}, test_mode: {test_mode}")
+            log("No leads found matching criteria for bulk email.", "warning")
+            return {"success": False, "message": _("No leads found to send emails to.")}
+
+        log(f"Enqueueing bulk email job for {lead_count} leads using template '{selected_template_name}'. TestMode: {is_test_mode}", "info")
         job = enqueue(
-            process_bulk_emails,
+            process_bulk_emails, # This function will now primarily use the template
             queue="long",
-            timeout=3600,  # 1 hour timeout
-            leads=leads,
-            tone=tone,
-            additional_context=additional_context,
-            test_mode=test_mode
+            timeout=3600, 
+            leads_data=leads_to_process, # Pass the list of lead dicts {name, email}
+            selected_template_name=selected_template_name,
+            test_mode=is_test_mode,
+            # Remove deprecated/unused: tone, additional_context
         )
         
-        # Use the job ID provided by RQ
         job_id = job.id
-        print(f"DEBUG - RQ job created with ID: {job_id}")
-        log(f"RQ job created with ID: {job_id}", "info")
-        
-        # Create job tracking document with the RQ job ID
-        job_data = {
+        log(f"Bulk email job enqueued. ID: {job_id}", "info")
+
+        # Job tracking (simplified, focusing on RQ job ID)
+        job_meta_data = {
             "job_id": job_id,
-            "leads_count": lead_count,
             "status": "queued",
-            "progress": 0,
-            "timestamp": now_datetime(),
-            "tone": tone,
-            "test_mode": test_mode,
+            "leads_count": lead_count,
+            "template_name": selected_template_name,
+            "test_mode": is_test_mode,
             "user": frappe.session.user,
-            "processed_leads": [],
-            "successful_leads": [],
-            "failed_leads": [],
-            "log_entries": []
+            "timestamp": now_datetime(),
+            "progress": 0,
+            "successful_leads_details": [],
+            "failed_leads_details": []
         }
-        
-        # Store job metadata in Redis with TTL of 24 hours
         job_meta_key = f"crm:bulk_email:job:{job_id}"
-        frappe.cache().set_value(job_meta_key, job_data, expires_in_sec=86400)
-        log(f"Job data stored in Redis with key: {job_meta_key}", "info")
-        
-        # Store job data in cache (legacy method) with the RQ job ID
-        frappe.cache().set_value(f"bulk_email_job_{job_id}", json.dumps(job_data, cls=CustomJSONEncoder), expires_in_sec=3600)
-        
-        response = {
+        frappe.cache().set_value(job_meta_key, job_meta_data, expires_in_sec=86400) # 24 hours TTL
+        log(f"Job metadata stored in Redis: {job_meta_key}", "debug")
+
+        return {
             "success": True,
-            "message": f"Bulk email generation started for {lead_count} leads. Check the logs for progress.",
+            "message": _("Bulk email job for {0} leads using template '{1}' has been started.").format(lead_count, selected_template_name),
             "job_id": job_id
         }
-        print(f"DEBUG - Returning response: {response}")
-        print("==== END BULK EMAIL DEBUG ====\n")
-        return response
-        
-    except Exception as e:
-        log(f"Error initiating bulk email generation: {str(e)}", "error")
-        log(f"Error traceback: {frappe.get_traceback()}", "error")
-        print(f"DEBUG - Error: {str(e)}")
-        print(f"DEBUG - Traceback: {frappe.get_traceback()}")
-        return {
-            "success": False,
-            "message": f"Error initiating bulk email generation: {str(e)}"
-        }
 
-def process_bulk_emails(leads, tone, additional_context, test_mode=True, **kwargs):
-    """Process the bulk email generation job
-    
-    This function is executed in a background job.
-    It updates the job status in Redis at each step.
-    
+    except Exception as e:
+        log(f"Error in generate_bulk_emails: {str(e)}", "error")
+        log(f"Traceback: {frappe.get_traceback()}", "error")
+        return {"success": False, "message": f"Error initiating bulk email job: {str(e)}"}
+
+
+def process_bulk_emails(leads_data, selected_template_name, test_mode=True, **kwargs):
+    """Processes bulk emails using a selected Frappe Email Template.
+    This function is executed by an RQ worker.
     Args:
-        leads (list): List of lead documents
-        tone (str): Email tone (professional, friendly, etc.)
-        additional_context (str): Additional instructions for AI
-        test_mode (bool): If True, emails will only be sent to test email
-        **kwargs: Additional arguments (for backward compatibility)
+        leads_data (list): List of dicts, each containing lead 'name' and 'email'.
+        selected_template_name (str): The name of the Frappe Email Template to use.
+        test_mode (bool): If True, emails are sent to the default outgoing email address.
     """
-    # Initialize environment first (critical for background jobs)
     init_environment()
-    
-    # Get the current job ID from RQ
     from rq import get_current_job
     current_job = get_current_job()
-    job_id = current_job.id if current_job else None
-    
-    if not job_id:
-        log("WARNING: No job ID found in RQ context. This shouldn't happen.", "error")
-        # Create a fallback job ID just in case
-        job_id = frappe.generate_hash(length=10)
-    
-    # For debugging, log the full job ID format
-    log(f"RQ Job ID: {job_id}", "debug")
-    
-    # Extract the simple ID without site prefix if present
-    simple_job_id = job_id.split("||")[1] if "||" in job_id else job_id
-    
-    # Create both key formats
-    job_meta_key = f"crm:bulk_email:job:{job_id}"
-    simple_meta_key = f"crm:bulk_email:job:{simple_job_id}"
-    
-    # Setup logging with job ID for tracking
-    job_log = lambda msg, level="info": log(f"[Job {simple_job_id}] {msg}", level)
-    
-    job_log(f"Starting bulk email generation for {len(leads)} leads (job_id: {job_id})", "info")
-    
-    try:
-        # Get job data from Redis (try both key formats)
-        job_data = frappe.cache().get_value(job_meta_key)
-        
-        # If not found with full key, try the simple key
-        if not job_data and job_id != simple_job_id:
-            job_data = frappe.cache().get_value(simple_meta_key)
-            job_log(f"Job data found with simple key: {simple_meta_key}", "debug")
-        
-        if not job_data:
-            job_log("Job data not found in Redis, creating new", "warning")
-            job_data = {
-                "job_id": job_id,
-                "simple_job_id": simple_job_id,  # Store both formats for reference
-                "leads_count": len(leads),
-                "status": "running",
-                "progress": 0,
-                "successful_leads_details": [],
-                "failed_leads_details": [],
-                "timestamp": now_datetime()
-            }
-        
-        # Update job status to running
-        job_data["status"] = "running"
-        
-        # Store with both key formats for maximum compatibility
-        frappe.cache().set_value(job_meta_key, job_data, expires_in_sec=86400)
-        
-        # Also store with simple key if different
-        if job_id != simple_job_id:
-            frappe.cache().set_value(simple_meta_key, job_data, expires_in_sec=86400)
-            job_log(f"Stored job data with both full and simple keys", "debug")
-                
-        # Get cache from traditional method too for backward compatibility
-        old_job_data_json = frappe.cache().get_value(f"bulk_email_job_{job_id}")
-        if not old_job_data_json:
-            old_job_data_json = frappe.cache().get_value(f"bulk_email_job_{simple_job_id}")
-            
-        if old_job_data_json:
-            try:
-                old_job_data = json.loads(old_job_data_json)
-                old_job_data["status"] = "running"
-                frappe.cache().set_value(f"bulk_email_job_{job_id}", 
-                                     json.dumps(old_job_data, cls=CustomJSONEncoder), 
-                                     expires_in_sec=3600)
-                
-                # Also store with simple key
-                frappe.cache().set_value(f"bulk_email_job_{simple_job_id}", 
-                                     json.dumps(old_job_data, cls=CustomJSONEncoder), 
-                                     expires_in_sec=3600)
-            except Exception as e:
-                job_log(f"Error updating old job data: {str(e)}", "error")
-                
-        # Process each lead
-        successful_leads_details = job_data.get("successful_leads_details", []) # Start with existing if resuming
-        failed_leads_details = job_data.get("failed_leads_details", [])
-        
-        total_leads = len(leads)
-        for i, lead_info in enumerate(leads):
-            lead_name = lead_info.get("name")
-            if not lead_name:
-                job_log(f"Skipping lead at index {i} due to missing name", "warning")
-                continue # Skip this iteration
-                
-            try:
-                job_log(f"Processing lead {i+1}/{total_leads}: {lead_name}", "info")
-                
-                # Update progress in Redis
-                progress = int(((i + 1) / total_leads) * 100)
-                job_data["progress"] = progress
-                frappe.cache().set_value(job_meta_key, job_data, expires_in_sec=86400)
-                
-                # Broadcast progress update via websocket
-                try:
-                    frappe.publish_realtime(
-                        "bulk_email_progress", 
-                        {"lead": lead_name, "progress": progress, "status": "processing", "job_id": job_id}
-                    )
-                except Exception as e:
-                    job_log(f"Error sending realtime update: {str(e)}", "error")
-                
-                # Process this lead - Use the modified function
-                result = generate_email_for_lead(lead_name, tone, additional_context, test_mode)
-                
-                # Record detailed success/failure
-                if result.get("generation_successful"):
-                    lead_detail = {
-                        "name": lead_name, 
-                        "communication_id": result.get("communication_id")
-                    }
-                    if result.get("sending_successful"):
-                        job_log(f"Successfully generated and sent email for lead {lead_name}", "info")
-                        successful_leads_details.append(lead_detail)
-                        # Send realtime update for success
-                        try:
-                            frappe.publish_realtime(
-                                "bulk_email_progress", 
-                                {"lead": lead_name, "progress": progress, "status": "success", "job_id": job_id}
-                            )
-                        except Exception as e:
-                            job_log(f"Error sending realtime success update: {str(e)}", "error")
-                    else:
-                        job_log(f"Generated communication for {lead_name} but failed to send email: {result.get('message')}", "error")
-                        lead_detail["error"] = f"Send failed: {result.get('message')}"
-                        failed_leads_details.append(lead_detail)
-                        # Send realtime update for error
-                        try:
-                            frappe.publish_realtime(
-                                "bulk_email_progress", 
-                                {"lead": lead_name, "progress": progress, "status": "error", "job_id": job_id, "error": result.get("message")}
-                            )
-                        except Exception as e:
-                            job_log(f"Error sending realtime error update: {str(e)}", "error")
-                else:
-                    job_log(f"Failed to generate email/communication for lead {lead_name}: {result.get('message')}", "error")
-                    failed_leads_details.append({
-                        "name": lead_name, 
-                        "error": f"Generation failed: {result.get('message')}"
-                    })
-                    # Send realtime update for error
-                    try:
-                        frappe.publish_realtime(
-                            "bulk_email_progress", 
-                            {"lead": lead_name, "progress": progress, "status": "error", "job_id": job_id, "error": result.get("message")}
-                        )
-                    except Exception as e:
-                        job_log(f"Error sending realtime error update: {str(e)}", "error")
+    job_id = current_job.id if current_job else frappe.generate_hash(length=10)
+    job_log = lambda msg, level="info": log(f"[Job {job_id}] {msg}", level)
 
-                # Update job data in Redis with detailed lists immediately after processing
-                job_data["successful_leads_details"] = successful_leads_details
-                job_data["failed_leads_details"] = failed_leads_details
-                frappe.cache().set_value(job_meta_key, job_data, expires_in_sec=86400)
-                
-                time.sleep(0.5) # Add delay
-                
-            except Exception as e:
-                # Catch unexpected errors during the loop iteration
-                job_log(f"CRITICAL LOOP ERROR processing lead {lead_name}: {str(e)}", "error")
-                job_log(f"ERROR TRACEBACK (loop): {frappe.get_traceback()}", "error")
-                failed_leads_details.append({"name": lead_name, "error": f"Loop error: {str(e)}"})
-                # Update job data in Redis immediately
-                job_data["failed_leads_details"] = failed_leads_details
-                frappe.cache().set_value(job_meta_key, job_data, expires_in_sec=86400)
-                
-        # Update final job status in Redis
-        job_data["status"] = "completed" if not failed_leads_details else "completed_with_errors"
-        job_data["progress"] = 100
-        job_data["completed_at"] = now_datetime()
-        frappe.cache().set_value(job_meta_key, job_data, expires_in_sec=86400)
+    job_log(f"Starting bulk processing for {len(leads_data)} leads using template '{selected_template_name}'. TestMode: {test_mode}", "info")
+    
+    job_meta_key = f"crm:bulk_email:job:{job_id}"
+    job_data = frappe.cache().get_value(job_meta_key) or {}
+    job_data.update({
+        "job_id": job_id, "status": "running",
+        "leads_count": len(leads_data),
+        "template_name": selected_template_name,
+        "test_mode": test_mode,
+        "timestamp": job_data.get("timestamp", now_datetime()),
+        "successful_leads_details": job_data.get("successful_leads_details", []),
+        "failed_leads_details": job_data.get("failed_leads_details", [])
+    })
+    frappe.cache().set_value(job_meta_key, job_data, expires_in_sec=86400)
+
+    total_leads = len(leads_data)
+    for i, lead_info in enumerate(leads_data):
+        lead_name = lead_info.get("name")
+        progress = int(((i + 1) / total_leads) * 100)
+        job_data["progress"] = progress
+        # frappe.publish_realtime(...) for progress can be added here if needed
+
+        if not lead_name:
+            job_log(f"Skipping lead at index {i} due to missing name.", "warning")
+            job_data["failed_leads_details"].append({"name": "Unknown", "error": "Missing lead name in data"})
+            continue
         
-        # Final log
-        success_count = len(successful_leads_details)
-        fail_count = len(failed_leads_details)
-        job_log(f"Bulk email job completed. Emails Sent Successfully: {success_count}, Failures (Generation or Send): {fail_count}", "info")
-        
-        # Broadcast completion
         try:
-            frappe.publish_realtime(
-                "bulk_email_complete", 
-                {
-                    "job_id": job_id, 
-                    "status": job_data["status"],
-                    "successful_count": success_count, 
-                    "failed_count": fail_count,
-                    "processed_details": successful_leads_details + failed_leads_details # Send combined list
-                }
+            job_log(f"Processing lead {i+1}/{total_leads}: {lead_name}", "info")
+            # Call generate_email_for_lead, now it needs to handle template name
+            result = generate_email_for_lead(
+                lead_name=lead_name, 
+                selected_template_name=selected_template_name, 
+                test_mode=test_mode,
+                # ai_tone and ai_additional_context are not passed, so AI path won't be taken
             )
+
+            if result.get("success"): # generate_email_for_lead now returns overall success
+                job_log(f"Successfully processed and sent email for lead {lead_name}", "info")
+                job_data["successful_leads_details"].append({"name": lead_name, "communication_id": result.get("communication_id")})
+            else:
+                error_msg = result.get("message", "Unknown error during processing")
+                job_log(f"Failed for lead {lead_name}: {error_msg}", "error")
+                job_data["failed_leads_details"].append({"name": lead_name, "error": error_msg, "communication_id": result.get("communication_id")})
+        
         except Exception as e:
-            job_log(f"Error sending completion notification: {str(e)}", "error")
-            
-        return {
-            "success": fail_count == 0,
-            "message": f"Processed {total_leads} leads. Success: {success_count}, Failed: {fail_count}",
-            "details": {
-                "successful": successful_leads_details,
-                "failed": failed_leads_details
-            }
+            job_log(f"CRITICAL LOOP ERROR for lead {lead_name}: {str(e)}", "error")
+            job_log(f"TRACEBACK: {frappe.get_traceback()}", "error")
+            job_data["failed_leads_details"].append({"name": lead_name, "error": f"Loop error: {str(e)}"})
+        
+        finally:
+            frappe.cache().set_value(job_meta_key, job_data, expires_in_sec=86400)
+            time.sleep(0.2) # Small delay between processing each lead
+
+    job_data["status"] = "completed" if not job_data["failed_leads_details"] else "completed_with_errors"
+    job_data["progress"] = 100
+    job_data["completed_at"] = now_datetime()
+    frappe.cache().set_value(job_meta_key, job_data, expires_in_sec=86400)
+    job_log(f"Bulk job finished. Success: {len(job_data['successful_leads_details'])}, Failed: {len(job_data['failed_leads_details'])}", "info")
+    # frappe.publish_realtime(...) for completion can be added here
+
+    return {
+        "success": not job_data["failed_leads_details"],
+        "message": f"Processed {total_leads} leads. Success: {len(job_data['successful_leads_details'])}, Failed: {len(job_data['failed_leads_details'])}",
+        "details": {
+            "successful": job_data['successful_leads_details'],
+            "failed": job_data['failed_leads_details']
         }
+    }
+
+
+def generate_email_for_lead(lead_name, selected_template_name=None, test_mode=True, ai_tone=None, ai_additional_context=None):
+    """ (V3 Logic) Generates and sends an email for a single lead.
+    If selected_template_name (Frappe Email Template) is provided, it's used (Jinja).
+    Else, if ai_tone is provided, AI is used based on default CRM AI System Prompt (V3 logic).
+    """
+    init_environment()
+    log(f"AI_PROMPT_V3_FLOW: generate_email_for_lead (V3) - START. Lead: '{lead_name}', FrappeTemplate: '{selected_template_name}', AITone: '{ai_tone}', TestMode: {test_mode}", "info")
+
+    communication_id = None
+    final_subject = "Error: Email Subject Not Set" 
+    final_html_for_sendmail = "<p>Error: Email content could not be generated.</p>"
+    overall_success = False 
+    is_content_ai_generated = False
+
+    try:
+        lead = frappe.get_doc("CRM Lead", lead_name)
+        if not lead.email: 
+            log(f"AI_PROMPT_V3_FLOW: Lead '{lead_name}' has no email address. Aborting.", "error")
+            raise ValueError(f"Lead '{lead_name}' has no email address.")
+
+        sender_user = frappe.session.user or "Administrator"
+        sender_email_address = get_formatted_email(sender_user)
+        sender_full_name_val = frappe.db.get_value("User", sender_user, "full_name") or "Sinx Solutions Team"
+        default_email_account_name = frappe.db.get_value("Email Account", {"default_outgoing": 1}, "name")
         
-    except Exception as e:
-        # Handle errors in the whole job execution
-        job_log(f"Critical error in bulk email job execution: {str(e)}", "error")
-        job_log(f"Error traceback: {frappe.get_traceback()}", "error")
+        log(f"AI_PROMPT_V3_FLOW: Sender: {sender_email_address} ({sender_full_name_val}), Default Outgoing Account: {default_email_account_name}", "debug")
+        if not default_email_account_name:
+            log("AI_PROMPT_V3_FLOW: No default outgoing Frappe Email Account configured. Aborting.", "error")
+            raise ValueError("No default outgoing Frappe Email Account configured.")
+
+        recipient_email_actual = lead.email
+        recipient_for_sendmail = recipient_email_actual
+        if test_mode:
+            test_recipient_email = frappe.db.get_value("User", sender_user, "email")
+            if not test_recipient_email: test_recipient_email = frappe.conf.get("test_email_recipient")
+            if not test_recipient_email:
+                log("AI_PROMPT_V3_FLOW: Test mode error: No test recipient email found (User or site_config.json:test_email_recipient).", "error")
+                raise ValueError("Test mode active, but no test recipient email found.")
+            recipient_for_sendmail = test_recipient_email
+            log(f"AI_PROMPT_V3_FLOW: TEST MODE. Email for Lead '{lead_name}' (Actual: {recipient_email_actual}) will be sent to '{recipient_for_sendmail}'", "info")
+
+        if selected_template_name: 
+            log(f"AI_PROMPT_V3_FLOW: Using Frappe Email Template (Jinja): '{selected_template_name}' for lead '{lead_name}'", "info")
+            is_content_ai_generated = False
+            template_doc = frappe.get_doc("Email Template", selected_template_name)
+            jinja_context = {"doc": lead.as_dict()} 
+            final_subject = frappe.render_template(template_doc.subject, jinja_context)
+            # Standard Frappe templates usually produce full HTML, so no render_full_email needed here.
+            final_html_for_sendmail = frappe.render_template(template_doc.response_, jinja_context)
+            log(f"AI_PROMPT_V3_FLOW: Rendered Frappe Email Template '{selected_template_name}'. Subject: '{final_subject}'", "debug")
         
-        # Update job status to error if job_data was initialized
-        if job_data:
-            try:
-                job_data["status"] = "error"
-                job_data["error"] = str(e)
-                job_data["error_at"] = now_datetime()
-                frappe.cache().set_value(job_meta_key, job_data, expires_in_sec=86400)
-            except Exception as e2:
-                job_log(f"Error updating job status to error: {str(e2)}", "error")
-                
-        # Try to broadcast error
-        try:
-            frappe.publish_realtime(
-                "bulk_email_error", 
-                {"job_id": job_id, "error": str(e)}
-            )
-        except Exception as e2:
-            job_log(f"Error sending error notification: {str(e2)}", "error")
+        elif ai_tone: 
+            log(f"AI_PROMPT_V3_FLOW: Using AI (V3 logic) for '{lead_name}'. UI Tone: '{ai_tone}'", "info")
+            is_content_ai_generated = True
             
-        # Ensure the RQ job itself is marked as failed by re-raising
-        raise e
+            openrouter_api_key = os.getenv("OPENROUTER_KEY")
+            if not openrouter_api_key: # Should be caught by generate_email_content, but defensive check.
+                log("AI_PROMPT_V3_FLOW: OpenRouter API key not configured. Aborting.", "error")
+                raise ValueError("OpenRouter API key not configured.")
+            
+            log(f"AI_PROMPT_V3_FLOW: Calling construct_prompt (V3) for AI generation for lead '{lead.name}'", "debug")
+            prompt_to_send_ai, model_id_for_ai = construct_prompt(lead.as_dict(), ai_tone, ai_additional_context)
+            
+            log(f"AI_PROMPT_V3_FLOW: Calling call_openrouter_api with model '{model_id_for_ai}' for lead '{lead.name}'", "debug")
+            ai_api_response = call_openrouter_api(prompt_to_send_ai, openrouter_api_key, model_id_for_ai)
+
+            if not ai_api_response.get("success"):
+                error_msg = ai_api_response.get('message', "Unknown AI API error during content generation.")
+                log(f"AI_PROMPT_V3_FLOW: AI API call failed for lead '{lead.name}': {error_msg}", "error")
+                raise ValueError(f"AI API call failed: {error_msg}")
+            
+            final_subject = ai_api_response.get("subject")
+            ai_generated_body_html = ai_api_response.get("content")
+
+            if final_subject is None or ai_generated_body_html is None:
+                log(f"AI_PROMPT_V3_FLOW: AI response missing 'subject' or 'content' for lead '{lead.name}'. Response: {ai_api_response}", "error")
+                raise ValueError("AI response from call_openrouter_api was successful but missing 'subject' or 'content' fields.")
+            
+            log(f"AI_PROMPT_V3_FLOW: AI content generated. Subject: '{final_subject}'. Body HTML length: {len(ai_generated_body_html)}", "debug")
+            
+            # Wrap the AI-generated body HTML with the standard email template/shell
+            log(f"AI_PROMPT_V3_FLOW: Wrapping AI-generated body HTML with render_full_email for lead '{lead.name}'", "debug")
+            final_html_for_sendmail = render_full_email(
+                ai_generated_body=ai_generated_body_html, 
+                lead_data=lead.as_dict(), 
+                sender_name=sender_full_name_val, # Use the acting Frappe user's name for the template wrapper
+                subject=final_subject
+            )
+            log(f"AI_PROMPT_V3_FLOW: AI content wrapped in full HTML email structure. Total length: {len(final_html_for_sendmail)}", "debug")
+        else:
+            log(f"AI_PROMPT_V3_FLOW: Error for lead '{lead.name}' - Method unclear: No Frappe Template and no AI Tone.", "error")
+            raise ValueError("Email generation method unclear: No Frappe template selected and AI tone not specified.")
+
+        log(f"AI_PROMPT_V3_FLOW: Creating Communication record for lead '{lead.name}'. Recipient: '{recipient_for_sendmail}'", "info")
+        comm_doc = frappe.get_doc({
+            "doctype": "Communication",
+            "communication_type": "Communication",
+            "communication_medium": "Email",
+            "subject": final_subject,
+            "content": final_html_for_sendmail, # This is the full HTML (possibly wrapped)
+            "text_content": html2text(final_html_for_sendmail), 
+            "reference_doctype": "CRM Lead",
+            "reference_name": lead.name,
+            "sender": sender_email_address,
+            "sender_full_name": sender_full_name_val,
+            "recipients": recipient_for_sendmail, 
+            "actual_recipient": recipient_email_actual if test_mode and recipient_for_sendmail != recipient_email_actual else None,
+            "email_status": "Open", 
+            "sent_or_received": "Sent",
+            "email_account": default_email_account_name,
+            "is_ai_generated": 1 if is_content_ai_generated else 0
+        })
+        comm_doc.insert(ignore_permissions=True) 
+        communication_id = comm_doc.name
+        log(f"AI_PROMPT_V3_FLOW: Communication record {communication_id} created. Is AI: {is_content_ai_generated}", "info")
+
+        email_send_args = {
+            "recipients": recipient_for_sendmail,
+            "sender": sender_email_address,
+            "subject": final_subject,
+            "message": final_html_for_sendmail, # Send the final, possibly wrapped, HTML
+            "reference_doctype": "CRM Lead",
+            "reference_name": lead.name,
+            "communication": communication_id,
+            "now": True 
+        }
+        log(f"AI_PROMPT_V3_FLOW: Queuing email (Comm ID {communication_id}) via frappe.sendmail. Args: {json.dumps(email_send_args, default=str)}", "debug")
+        frappe.sendmail(**email_send_args)
+        frappe.db.commit() 
+        log(f"AI_PROMPT_V3_FLOW: frappe.sendmail called and db.commit() for Comm ID {communication_id}.", "info")
+        
+        frappe.db.set_value("Communication", communication_id, "email_status", "Sent")
+        frappe.db.commit() 
+        log(f"AI_PROMPT_V3_FLOW: Communication {communication_id} status updated to 'Sent'.", "info")
+        overall_success = True
+
+    except frappe.DoesNotExistError as e_dnf:
+        error_msg = f"Lead '{lead_name}' not found in generate_email_for_lead: {str(e_dnf)}"
+        log(f"AI_PROMPT_V3_FLOW: {error_msg}", "error")
+        return {"success": False, "message": error_msg, "communication_id": None}
+    except Exception as e_general:
+        error_msg = f"Error in generate_email_for_lead for '{lead_name}': {str(e_general)}"
+        log(f"AI_PROMPT_V3_FLOW: {error_msg}", "error")
+        log(f"AI_PROMPT_V3_FLOW: TRACEBACK: {frappe.get_traceback()}", "error")
+        if communication_id:
+            try:
+                frappe.db.set_value("Communication", communication_id, "email_status", "Error")
+                frappe.db.set_value("Communication", communication_id, "error_details", error_msg) 
+                frappe.db.commit()
+                log(f"AI_PROMPT_V3_FLOW: Comm {communication_id} status set to 'Error'.", "warning")
+            except Exception as db_update_err:
+                log(f"AI_PROMPT_V3_FLOW: Failed to update comm {communication_id} to Error: {str(db_update_err)}", "error")
+        
+        if not frappe.exc_already_raised:
+             pass 
+        return {"success": False, "message": error_msg, "communication_id": communication_id}
+    
+    log(f"AI_PROMPT_V3_FLOW: generate_email_for_lead (V3) - FINISHED for '{lead_name}'. Success: {overall_success}", "info")
+    return {"success": overall_success, 
+            "message": "Email processed successfully" if overall_success else f"Email processing failed for {lead_name}", 
+            "communication_id": communication_id}
 
 @frappe.whitelist()
 def get_bulk_email_job_status(job_id=None):
@@ -1169,13 +1142,21 @@ def get_api_status():
     }
 
 @frappe.whitelist()
-def send_ai_email(recipients, subject, content, doctype="CRM Lead", name=None, cc=None, bcc=None, force_resend=False):
-    """Send an email using Frappe's email system but keeping the AI-generated content and HTML template"""
-    log(f"==== BACKEND: AI EMAIL SENDING STARTED ====", "info")
-    log(f"DETAILS: Recipients={recipients}, Subject={subject}, DocType={doctype}, Name={name}", "info")
+def send_ai_email(recipients, subject, content, doctype="CRM Lead", name=None, cc=None, bcc=None, force_resend=False, selected_template_name=None): # Added selected_template_name
+    """Sends an email. 
+    If selected_template_name is provided, it fetches that Frappe Email Template, 
+    renders it using the lead data, and sends that. 
+    Otherwise, it sends the raw content received from the frontend.
+    """
+    log(f"==== BACKEND: send_ai_email Sending START ====", "info")
+    log(f"DETAILS: Recipients={recipients}, Subject={subject}, DocType={doctype}, Name={name}, Template='{selected_template_name}'", "info")
+    log(f"BACKEND: Initial content received (first 200 chars): {content[:200]}...", "debug")
     
+    final_subject = subject # Default subject from frontend
+    final_message = content # Default message from frontend
+
     try:
-        # Get current user information
+        # --- Get Sender Info (Keep existing logic) --- 
         try:
             user = frappe.get_doc("User", frappe.session.user)
             sender_name = user.full_name or os.getenv("SENDER_NAME") or "Sinx Solutions"
@@ -1186,80 +1167,85 @@ def send_ai_email(recipients, subject, content, doctype="CRM Lead", name=None, c
             sender = frappe.session.user
             log(f"BACKEND: Using fallback sender_name: {sender_name}, sender: {sender}", "info")
             log(f"BACKEND: Error getting user info: {str(e)}", "error")
-        
-        # Get recipient first name if doctype and name provided
-        recipient_name = "there"
-        if doctype == "CRM Lead" and name:
+
+        # --- Determine Final Subject and Message --- 
+        if selected_template_name:
+            log(f"BACKEND: Selected template specified: '{selected_template_name}'. Will use this template.", "info")
             try:
-                lead = frappe.get_doc(doctype, name)
-                recipient_name = lead.first_name or "there"
-                log(f"BACKEND: Found lead with first_name: {recipient_name}", "info")
+                # Fetch context document (e.g., Lead)
+                doc_context = frappe.get_doc(doctype, name)
+                doc_dict = doc_context.as_dict()
                 
-                # Update subject if needed
-                if not subject or subject == "Email from Lead":
-                    lead_prefix = lead.lead_name or lead.organization or ""
-                    if lead_prefix:
-                        subject = f"{lead_prefix} ({lead.name})"
-                    else:
-                        subject = f"Regarding Lead {lead.name}"
-                    log(f"BACKEND: Updated subject to: {subject}", "info")
-            except Exception as e:
-                log(f"BACKEND: Error fetching lead: {str(e)}", "error")
-        
-        # Format email addresses
+                # Fetch the specified Frappe Email Template
+                template_doc = frappe.get_doc("Email Template", selected_template_name)
+                log(f"BACKEND: Fetched Frappe Email Template: {template_doc.name}", "debug")
+
+                # Prepare context for rendering template
+                context = {"doc": doc_dict}
+                log(f"BACKEND: Rendering context prepared. Keys: {list(context.keys())}", "debug")
+
+                # Render template subject and body
+                final_subject = frappe.render_template(template_doc.subject, context)
+                final_message = frappe.render_template(template_doc.response_, context)
+                log(f"BACKEND: Rendered template. Subject='{final_subject}', Message Length={len(final_message)}", "info")
+
+            except Exception as template_error:
+                log(f"BACKEND: ERROR rendering selected template '{selected_template_name}': {str(template_error)}", "error")
+                log(f"BACKEND: Traceback: {frappe.get_traceback()}", "error")
+                # Fallback: Send the raw content from editor with original subject in case of template error
+                final_subject = subject
+                final_message = content
+                log(f"BACKEND: FALLBACK - Using raw content from editor due to template rendering error.", "warning")
+                # Optional: Add error info to subject/message?
+                # final_subject = f"[Template Error] {subject}"
+                # final_message = f"<p><b>Error rendering template '{selected_template_name}': {str(template_error)}</b></p><hr/>{content}"
+        else:
+            log(f"BACKEND: No selected template. Using raw subject/content from editor.", "info")
+            # final_subject and final_message are already set to frontend values
+
+        # --- Format recipients (Keep existing logic) --- 
         recipient_list = recipients.split(',') if isinstance(recipients, str) else recipients
         recipient_list = [email.strip() for email in recipient_list]
-        
         cc_list = []
         if cc:
             cc_list = cc.split(',') if isinstance(cc, str) else cc
             cc_list = [email.strip() for email in cc_list]
-        
         bcc_list = []
         if bcc:
             bcc_list = bcc.split(',') if isinstance(bcc, str) else bcc
             bcc_list = [email.strip() for email in bcc_list]
-        
-        log(f"BACKEND: Parsed recipients={recipient_list}, cc={cc_list}, bcc={bcc_list}", "info")
-        
-        # Create email template and wrap content in it
-        html_template = get_email_template(subject)
-        # Use the correct placeholders defined in get_email_template
-        rendered_html = html_template.replace("__AI_EMAIL_BODY_CONTENT__", content)
-        rendered_html = rendered_html.replace("__SENDER_FULL_NAME__", sender_name)
-        # Note: The template doesn't have a placeholder for recipient_name like "{ name }" was attempting before.
-
-        log("BACKEND: Email template applied to content", "info")
-        
-        # Convert recipients to comma-separated string for Frappe's sendmail
         recipients_str = ", ".join(recipient_list) if isinstance(recipient_list, list) else recipient_list
         cc_str = ", ".join(cc_list) if isinstance(cc_list, list) and cc_list else ""
         bcc_str = ", ".join(bcc_list) if isinstance(bcc_list, list) and bcc_list else ""
+        log(f"BACKEND: Formatted recipients='{recipients_str}', cc='{cc_str}', bcc='{bcc_str}'", "debug")
         
-        # Convert HTML to text
+        # --- Convert final HTML to text (Keep existing logic) --- 
+        text_content_for_communication = ""
         try:
             from frappe.utils.html_utils import html2text
+            text_content_for_communication = html2text(final_message)
         except ImportError:
             try:
                 from frappe.utils.html import html2text
+                text_content_for_communication = html2text(final_message)
             except ImportError:
-                # Simple fallback if html2text is not available
                 import re
-                def html2text(html_content):
-                    text = re.sub(r'<[^>]*>', ' ', html_content)
+                def local_html2text(html_content_arg):
+                    text = re.sub(r'<[^>]*>', ' ', html_content_arg)
                     return re.sub(r'\s+', ' ', text).strip()
-        
-        # Create Communication doc first
-        log("BACKEND: Creating communication record directly", "info")
+                text_content_for_communication = local_html2text(final_message)
+
+        # --- Create Communication (Use final_subject, final_message) --- 
+        log("BACKEND: Creating communication record", "info")
         communication = frappe.get_doc({
             "doctype": "Communication",
             "communication_type": "Communication",
             "communication_medium": "Email",
             "sent_or_received": "Sent",
             "email_status": "Open",
-            "subject": subject,
-            "content": rendered_html,
-            "text_content": html2text(rendered_html),
+            "subject": final_subject, # Use final determined subject
+            "content": final_message, # Use final determined message
+            "text_content": text_content_for_communication,
             "sender": sender,
             "sender_full_name": sender_name,
             "recipients": recipients_str,
@@ -1271,14 +1257,12 @@ def send_ai_email(recipients, subject, content, doctype="CRM Lead", name=None, c
             "timeline_doctype": doctype,
             "timeline_name": name
         })
-        
-        # Insert the communication doc
         communication.flags.ignore_permissions = True
         communication.flags.ignore_mandatory = True
         communication.insert()
-        log(f"BACKEND: Communication created with ID: {communication.name}", "info")
+        log(f"BACKEND: Communication created: {communication.name}", "info")
         
-        # Create Communication Link to ensure it shows up in the timeline
+        # --- Create Communication Link (Keep existing logic) --- 
         log(f"BACKEND: Creating Communication Link for {doctype}/{name}", "info")
         comm_link = frappe.get_doc({
             "doctype": "Communication Link",
@@ -1291,23 +1275,29 @@ def send_ai_email(recipients, subject, content, doctype="CRM Lead", name=None, c
         comm_link.insert(ignore_permissions=True)
         log(f"BACKEND: Communication Link created successfully", "info")
             
-        # Now send the actual email using Frappe's sendmail
+        # --- Log final message before send (Keep existing logic) --- 
+        log(f"BACKEND: Preparing to call frappe.sendmail", "debug")
+        log(f"BACKEND: Recipients='{recipients_str}', Sender='{sender}', Subject='{final_subject}'", "debug")
+        html_preview = final_message[:500] + ("..." if len(final_message) > 500 else "")
+        log(f"BACKEND: Message HTML (first 500 chars + length: {len(final_message)}): {html_preview}", "debug")
+        # log(f"BACKEND: FULL HTML MESSAGE TO SEND:\n{final_message}", "debug")
+        
+        # --- Send Email (Use final_subject, final_message) --- 
         log("BACKEND: Sending email via Frappe's sendmail", "info")
         frappe.sendmail(
             recipients=recipients_str,
             sender=sender,
-            subject=subject,
-            message=rendered_html,
-            communication=communication.name,  # Link to the communication doc
+            subject=final_subject, # Use final determined subject
+            message=final_message, # Use final determined message
+            communication=communication.name,
             reference_doctype=doctype,
             reference_name=name,
             cc=cc_str,
             bcc=bcc_str,
-            now=True,  # Send immediately
-            expose_recipients="header"  # Show all recipients in the email
+            now=True,
+            expose_recipients="header"
         )
         
-        # Force commit changes to database to ensure they're visible right away
         frappe.db.commit()
         log(f"BACKEND: Email sent successfully and committed to database", "info")
         
@@ -1318,7 +1308,7 @@ def send_ai_email(recipients, subject, content, doctype="CRM Lead", name=None, c
         }
         
     except Exception as e:
-        log(f"==== BACKEND ERROR: {str(e)} ====", "error")
+        log(f"==== BACKEND ERROR in send_ai_email: {str(e)} ====", "error")
         log(f"Error traceback: {frappe.get_traceback()}", "error")
         return {
             "success": False,
@@ -1503,191 +1493,6 @@ def get_lead_structure(lead_name):
             "success": False,
             "message": f"Error getting lead structure: {str(e)}"
         }
-
-def generate_email_for_lead(lead_name, tone="professional", additional_context="", test_mode=True):
-    """Generate an AI email for a single lead and attempt to send it.
-    
-    Args:
-        lead_name (str): Lead name/ID
-        tone (str, optional): Email tone. Defaults to "professional".
-        additional_context (str, optional): Additional context for AI. Defaults to "".
-        test_mode (bool, optional): If True, email will be sent to the default outgoing address. Defaults to True.
-        
-    Returns:
-        dict: Result indicating success/failure of generation AND sending attempt.
-    """
-    generation_successful = False
-    sending_successful = False
-    communication_id = None
-    error_message = None
-    subject = "AI Email Generation Failed" # Default subject
-    ai_generated_body = "<p>There was an error generating the AI email content.</p>" # Default body content
-
-    try:
-        log(f"BEGIN: Generating email for lead: {lead_name}", "info")
-        
-        # 1. Get Lead Data
-        lead = frappe.get_doc("CRM Lead", lead_name)
-        lead_fields = lead.as_dict()
-        
-        # 2. Generate AI Content
-        log(f"Starting AI content generation for {lead_name}", "debug")
-        try:
-            # Prepare lead fields for prompt
-            fields_to_exclude = [
-                "amended_from", "docstatus", "parent", "parentfield", 
-                "parenttype", "idx", "owner", "creation", "modified", 
-                "modified_by", "doctype", "_user_tags", "__islocal", "__unsaved"
-            ]
-            prepared_lead_fields = lead_fields.copy()
-            for field in fields_to_exclude:
-                if field in prepared_lead_fields:
-                    del prepared_lead_fields[field]
-            
-            # Construct prompt
-            prompt = construct_prompt(prepared_lead_fields, tone, additional_context)
-            log(f"Prompt constructed for lead {lead_name}", "debug")
-
-            # Get API key
-            openrouter_key = os.getenv("OPENROUTER_KEY")
-            if not openrouter_key:
-                raise ValueError("OpenRouter API key not found in .env file.")
-
-            # Call AI API
-            ai_response = call_openrouter_api(prompt, openrouter_key)
-            
-            if not ai_response.get("success"):
-                raise ValueError(f"AI API call failed: {ai_response.get('message', 'Unknown API error')}")
-
-            # Use generated subject and content BODY
-            subject = ai_response.get("subject", f"Follow up regarding {lead.lead_name or lead_name}")
-            ai_generated_body = ai_response.get("content", "<p>Error retrieving content from AI response.</p>")
-            generation_successful = True
-            log(f"AI content generated successfully for lead {lead_name}", "info")
-
-        except Exception as ai_error:
-            error_message = f"Error during AI content generation: {str(ai_error)}"
-            log(f"ERROR: AI Generation failed for lead {lead_name}. Error: {str(ai_error)}", "error")
-
-        # 3. Prepare Email Sending Details
-        # Get recipient email
-        recipient_email = lead.email
-        if not recipient_email:
-            raise ValueError(f"Lead {lead_name} has no email address.")
-        
-        # Use default outgoing email as recipient in test mode for safety
-        default_sender_email = frappe.db.get_value("Email Account", {"default_outgoing": 1}, "email_id")
-        if test_mode:
-            if not default_sender_email:
-                 raise ValueError("Cannot run in test_mode: No default outgoing email account configured to send test emails to.")
-            original_recipient = recipient_email
-            recipient_email = default_sender_email 
-            log(f"TEST MODE: Overriding recipient to default sender: {recipient_email} (Original: {original_recipient})", "info")
-        else:
-             log(f"Recipient determined: {recipient_email} (test_mode: {test_mode})", "info")
-
-        # Determine sender 
-        sender = get_formatted_email(frappe.session.user or "Administrator")
-        sender_name_only = frappe.db.get_value("User", frappe.session.user or "Administrator", "full_name") or "Sinx Solutions"
-        log(f"Sender determined: {sender}", "info")
-
-        # Get default outgoing email account name
-        default_email_account_name = frappe.db.get_value(
-            "Email Account", {"default_outgoing": 1}, "name"
-        )
-        if not default_email_account_name:
-            raise ValueError("No default outgoing email account configured.")
-        log(f"Default outgoing email account determined: {default_email_account_name}", "info")
-        
-        # 3.1 Render Full HTML Email using the template
-        log(f"Rendering full HTML email for {lead_name}", "debug")
-        full_html_content = render_full_email(
-            ai_generated_body=ai_generated_body, 
-            lead_data=lead_fields, # Pass the original lead dict
-            sender_name=sender_name_only,
-            subject=subject
-        )
-        log(f"Full HTML content rendered. Length: {len(full_html_content)}", "debug")
-
-        # 4. Create Communication Record
-        # (Use AI generated subject and FULL RENDERED HTML content)
-        comm = frappe.get_doc({
-            "doctype": "Communication",
-            "communication_type": "Communication",
-            "communication_medium": "Email",
-            "subject": subject,
-            "content": full_html_content, # <--- Use fully rendered HTML
-            "text_content": html2text(full_html_content), # Also generate plain text version
-            "reference_doctype": "CRM Lead",
-            "reference_name": lead.name,
-            "sender": sender,
-            "recipients": recipient_email,
-            "email_status": "Open",
-            "sent_or_received": "Sent",
-            "email_account": default_email_account_name,
-            "is_ai_generated": 1 if generation_successful else 0
-        })
-        comm.insert(ignore_permissions=True)
-        communication_id = comm.name
-        log(f"Communication record created: {communication_id} (AI Success: {generation_successful})", "info")
-
-        # 5. Attempt to Send Email via Frappe Queue
-        try:
-            email_args = {
-                "recipients": recipient_email,
-                "sender": sender,
-                "subject": subject,
-                "message": full_html_content, # <--- Use fully rendered HTML
-                "reference_doctype": "CRM Lead",
-                "reference_name": lead.name,
-                "communication": communication_id,
-                "now": True 
-            }
-            log(f"ATTEMPTING EMAIL SEND via frappe.sendmail for Comm: {communication_id}", "info")
-            log(f"DEBUG: Args for frappe.sendmail: {json.dumps(email_args, default=str)}", "debug")
-
-            frappe.sendmail(**email_args)
-            
-            frappe.db.commit()
-
-            sending_successful = True
-            log(f"SUCCESS: frappe.sendmail completed for Comm: {communication_id}. Email queued.", "info")
-            
-            frappe.db.set_value("Communication", communication_id, "email_status", "Sent")
-            frappe.db.commit() # Commit status update
-            log(f"Communication status updated to Sent for {communication_id}", "info")
-
-        except Exception as email_error:
-            sending_successful = False
-            error_message = f"Error during frappe.sendmail: {str(email_error)}"
-            log(f"ERROR: frappe.sendmail failed for Comm: {communication_id}. Error: {str(email_error)}", "error")
-            log(f"ERROR TRACEBACK (sendmail): {frappe.get_traceback()}", "error")
-            try:
-                frappe.db.set_value("Communication", communication_id, "email_status", "Error")
-                frappe.db.commit()
-                log(f"Communication status updated to Error for {communication_id}", "warning")
-            except Exception as db_update_err:
-                log(f"ERROR: Could not update communication status to Error for {communication_id}: {str(db_update_err)}", "error")
-
-    except Exception as e:
-        # Catch broader errors (e.g., lead fetch, missing email, missing default account)
-        if not error_message: # Avoid overwriting specific AI or sendmail errors
-             error_message = f"Error during email generation process: {str(e)}"
-        log(f"CRITICAL ERROR: Process failed for lead {lead_name}. Error: {str(e)}", "error")
-        log(f"ERROR TRACEBACK (main): {frappe.get_traceback()}", "error")
-        generation_successful = generation_successful 
-        sending_successful = False 
-
-    # Return detailed status
-    final_status = {
-        "success": generation_successful and sending_successful, # Overall success requires both
-        "message": error_message if error_message else ("Email generated and sent/queued successfully" if generation_successful else "Email generation failed"),
-        "generation_successful": generation_successful,
-        "sending_successful": sending_successful,
-        "communication_id": communication_id
-    }
-    log(f"END: Result for lead {lead_name}: {json.dumps(final_status, default=str)}", "info")
-    return final_status
 
 @frappe.whitelist()
 def debug_failed_job(job_id):
